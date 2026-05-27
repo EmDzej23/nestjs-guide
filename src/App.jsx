@@ -143,7 +143,12 @@ function OverviewChapter({ chapter }) {
   return (
     <div className="chapter-body">
       <div className="overview-hero">
-        <div className="overview-hero-tag">{chapter.tag}</div>
+        <div
+        className="overview-hero-tag"
+        style={{ color: chapter.tag?.color, background: chapter.tag?.bg, borderColor: chapter.tag?.color }}
+      >
+        {chapter.tag?.label}
+      </div>
         <h1 className="overview-hero-title">{chapter.title}</h1>
         <p className="overview-hero-desc">{chapter.description}</p>
         <div className="stat-row">
@@ -210,7 +215,12 @@ function PipelineChapter({ chapter }) {
   return (
     <div className="chapter-body">
       <div className="section-header">
-        <span className="tag">{chapter.tag}</span>
+        <span
+          className="tag"
+          style={{ color: chapter.tag?.color, background: chapter.tag?.bg, borderColor: chapter.tag?.color }}
+        >
+          {chapter.tag?.label}
+        </span>
         <h2 className="section-title" style={{ marginTop: 8 }}>{chapter.title}</h2>
         <p className="section-desc">{chapter.description}</p>
       </div>
@@ -242,7 +252,12 @@ function GenericChapter({ chapter }) {
   return (
     <div className="chapter-body">
       <div className="section-header">
-        <span className="tag">{chapter.tag}</span>
+        <span
+          className="tag"
+          style={{ color: chapter.tag?.color, background: chapter.tag?.bg, borderColor: chapter.tag?.color }}
+        >
+          {chapter.tag?.label}
+        </span>
         <h1 className="chapter-title">{chapter.title}</h1>
         {chapter.subtitle && <div className="chapter-subtitle">{chapter.subtitle}</div>}
         {chapter.description && <p className="chapter-desc">{chapter.description}</p>}
@@ -298,7 +313,12 @@ export default function App() {
           <span className="progress-label">{current + 1} / {total}</span>
         </div>
         <div className="header-right">
-          <span className="header-tag">{chapter.tag}</span>
+          <span
+            className="header-tag"
+            style={{ color: chapter.tag?.color, background: chapter.tag?.bg, borderColor: chapter.tag?.color }}
+          >
+            {chapter.tag?.label}
+          </span>
         </div>
       </header>
 
