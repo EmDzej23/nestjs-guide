@@ -1334,6 +1334,1084 @@ services:
     # Distributed tracing non-negotiable in a 6-service fleet.
     # Without it, debugging a slow bet placement takes hours.`
 
+// ─── Additional snippets ──────────────────────────────────────────────────────
+
+S.nestDecorators = `// NestJS Decorator Reference — what each decorator does under the hood
+//
+// Every decorator is a TypeScript factory function that calls
+// Reflect.defineMetadata() to attach configuration to the class/method.
+// NestJS reads this metadata at startup when it scans the DI container.
+
+// ── @Module ──────────────────────────────────────────────────────────────────
+// Root metadata: describes what this module imports, provides, and exports.
+//   imports:     other modules whose exported providers this module can use
+//   providers:   services/guards registered with DI (singleton by default)
+//   controllers: route handlers; NestJS registers @Get/@Post with the HTTP adapter
+//   exports:     subset of providers visible to other modules that import this one
+
+@Module({
+  imports: [TypeOrmModule.forFeature([Bet, BetSelection])],
+  providers: [BetRepository, BetDomainService, PlaceBetHandler],
+  controllers: [BettingController],
+  exports: [BetRepository],  // only BetRepository is visible outside this module
+})
+export class BettingModule {}
+
+// ── @Injectable ──────────────────────────────────────────────────────────────
+// Marks a class as a DI provider. NestJS reads constructor param types
+// via TypeScript's reflect-metadata to automatically resolve dependencies.
+// Without @Injectable() the metadata is never emitted — injection silently fails.
+
+@Injectable()
+export class OddsService {
+  constructor(
+    private readonly redis: RedisService,          // injected by type
+    @Inject(CONFIG_TOKEN) private readonly cfg: AppConfig, // injected by token
+  ) {}
+}
+
+// ── @Controller ──────────────────────────────────────────────────────────────
+// Registers HTTP route handlers. The path prefix applies to all methods inside.
+// version: '1' → /api/v1/bets (requires enableVersioning in main.ts)
+@Controller({ path: 'bets', version: '1' })
+export class BettingController {}
+
+// ── @Get / @Post / @Patch / @Delete ─────────────────────────────────────────
+// Method decorators that register routes with the HTTP adapter (Express/Fastify).
+// @HttpCode(201): overrides the default 200 response status for POST handlers.
+@Get(':id')               // GET /bets/:id
+@Post()                   // POST /bets
+@Patch(':id/cashout')     // PATCH /bets/:id/cashout
+@HttpCode(201)            // respond 201 on POST
+async handler() {}
+
+// ── Parameter decorators ─────────────────────────────────────────────────────
+// Each decorator extracts one piece of the incoming request.
+async example(
+  @Param('id', ParseUUIDPipe) id: string,           // route param, UUID-validated
+  @Body() dto: PlaceBetDto,                          // request body → through pipes
+  @Query('limit', ParseIntPipe) limit: number,       // ?limit=20 → number
+  @Headers('x-correlation-id') corrId: string,       // single header value
+  @Req() req: Request,                               // raw Express request (avoid — use specific decorators)
+  @CurrentUser() user: JwtPayload,                   // custom decorator (createParamDecorator)
+) {}
+
+// ── @UseGuards / @UseInterceptors / @UsePipes / @UseFilters ─────────────────
+// Method-level scope: applied to this handler only (vs global APP_GUARD).
+// Evaluated AFTER global providers, in left-to-right order.
+@Get('admin')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@UseInterceptors(AuditInterceptor)
+@UsePipes(new ValidationPipe({ whitelist: true }))
+async adminRoute() {}
+
+// ── createParamDecorator ──────────────────────────────────────────────────────
+// Build custom parameter decorators. 'data' is what you pass in the decorator call.
+// @CurrentUser() → full JwtPayload
+// @CurrentUser('sub') → just the userId string
+export const CurrentUser = createParamDecorator(
+  (field: keyof JwtPayload | undefined, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    return field ? request.user?.[field] : request.user;
+  },
+);
+
+// ── SetMetadata + Reflector ───────────────────────────────────────────────────
+// The pattern behind every custom decorator that modifies guard/interceptor behaviour.
+// SetMetadata attaches a value to the handler; Reflector reads it.
+export const ROLES_KEY = 'roles';
+export const Roles = (...roles: UserRole[]) => SetMetadata(ROLES_KEY, roles);
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+export const Timeout = (ms: number) => SetMetadata(REQUEST_TIMEOUT_KEY, ms);
+
+// In a guard: read the metadata attached to the current handler
+canActivate(ctx: ExecutionContext): boolean {
+  const roles = this.reflector.getAllAndOverride<UserRole[]>(ROLES_KEY, [
+    ctx.getHandler(), // method-level decorator wins over class-level
+    ctx.getClass(),
+  ]);
+  return roles?.some(r => user.roles.includes(r)) ?? true;
+}`
+
+S.diProviders = `// Provider patterns — four ways to register a provider in NestJS DI
+// All patterns resolve to the same Reflect.defineMetadata mechanism under the hood.
+
+// ── 1. useClass (most common) ─────────────────────────────────────────────────
+// NestJS instantiates the class and resolves its constructor dependencies.
+{ provide: OddsService, useClass: OddsService }
+// Shorthand (identical):
+// providers: [OddsService]
+
+// Swap implementations without changing injection sites:
+{
+  provide: BetRepository,
+  useClass: process.env.NODE_ENV === 'test' ? InMemoryBetRepository : PostgresBetRepository,
+}
+
+// ── 2. useFactory ─────────────────────────────────────────────────────────────
+// Runs at module init. Supports async — NestJS awaits it before marking the module ready.
+// inject[] lists the dependencies passed to the factory as positional arguments.
+{
+  provide: REDIS_CLIENT,
+  useFactory: async (config: ConfigService): Promise<IORedis> => {
+    const client = new IORedis({
+      host:      config.getOrThrow('REDIS_HOST'),
+      port:      config.get<number>('REDIS_PORT', 6379),
+      password:  config.get('REDIS_PASSWORD'),
+      tls:       config.get('NODE_ENV') === 'production' ? {} : undefined,
+      retryStrategy: (times) => Math.min(times * 100, 3000), // exponential backoff cap 3s
+      keyPrefix: config.get('REDIS_KEY_PREFIX', 'bp:'),      // namespace isolation
+    });
+    // Wait for connection before NestJS marks module ready.
+    // Without this, the first Redis call may race against connection setup.
+    await new Promise<void>((res, rej) => {
+      client.once('ready', res);
+      client.once('error', rej);
+    });
+    return client;
+  },
+  inject: [ConfigService],
+}
+
+// ── 3. useValue ───────────────────────────────────────────────────────────────
+// Injects a static value. Useful for constants, compiled config, and test mocks.
+{ provide: 'MAX_RETRY_ATTEMPTS', useValue: 3 }
+{ provide: APP_CONFIG, useValue: { maxBetSizeMinorUnits: 10_000_000 } }
+
+// ── 4. useExisting (alias) ────────────────────────────────────────────────────
+// Both tokens resolve to the SAME singleton instance — no second instantiation.
+// Use when renaming a service but keeping backward-compatible injection.
+{ provide: 'LegacyBetService', useExisting: BettingService }
+
+// ── Injection Scopes ───────────────────────────────────────────────────────────
+// DEFAULT (singleton): one instance per DI container lifetime. 99% of services.
+// REQUEST: new instance per HTTP request. Required for per-request state.
+//   ⚠️  Scope bubble: every provider that injects a REQUEST-scoped service also
+//   becomes REQUEST-scoped. This cascades upward and accidentally degrades
+//   performance — singleton services turn into per-request allocations.
+// TRANSIENT: new instance at every injection point. Almost never needed.
+
+@Injectable({ scope: Scope.REQUEST })
+export class RequestContextService {
+  // Safe to read request here — a new instance exists for each incoming request
+  constructor(@Inject(REQUEST) private readonly req: Request) {}
+  getCorrelationId(): string { return this.req.headers['x-correlation-id'] as string; }
+}
+
+// ── @Global() ─────────────────────────────────────────────────────────────────
+// Exports providers to ALL modules automatically — no import needed.
+// Use sparingly: only for true cross-cutting infrastructure (Redis, Kafka, Telemetry).
+// Over-using @Global() creates invisible coupling and makes module boundaries meaningless.
+
+@Global()
+@Module({ providers: [RedisService], exports: [RedisService] })
+export class RedisModule {}`
+
+S.grpcProto = `// libs/proto/betting.proto
+// Protocol Buffers: the strongly typed contract between microservices.
+// All services share this single source of truth. Generated TypeScript types
+// via: npx ts-proto --ts_proto_out=./libs/proto betting.proto
+
+syntax = "proto3";
+package betting.v1;
+
+// ── Service definition ────────────────────────────────────────────────────────
+// Each rpc maps to exactly one @GrpcMethod() handler in NestJS.
+// stream return → Observable<T> in NestJS (server-side streaming).
+service BettingService {
+  rpc PlaceBet             (PlaceBetRequest)       returns (PlaceBetResponse);
+  rpc GetBet               (GetBetRequest)         returns (BetResponse);
+  rpc CashoutBet           (CashoutRequest)        returns (CashoutResponse);
+  rpc VoidBet              (VoidBetRequest)        returns (VoidBetResponse);
+  // Server streaming: continuously pushes updated cashout values to the client
+  rpc StreamCashoutValues  (CashoutStreamRequest)  returns (stream CashoutValueUpdate);
+}
+
+// ── Messages ──────────────────────────────────────────────────────────────────
+// int64 for all monetary values — no floats in protobuf for money.
+// optional: field is explicitly absent (proto3 otherwise defaults to 0 / "")
+message PlaceBetRequest {
+  string   user_id            = 1;
+  string   operator_id        = 2;
+  string   bet_type           = 3;
+  repeated SelectionInput selections = 4;
+  int64    stake_minor_units  = 5;  // pence/cents, never float
+  string   odds_acceptance    = 6;  // ANY | BETTER_ONLY | EXACT
+  string   currency           = 7;
+  string   idempotency_key    = 8;  // from Idempotency-Key header
+  string   correlation_id     = 9;
+  optional string free_bet_token_id = 10;
+}
+
+message PlaceBetResponse {
+  string bet_id          = 1;
+  string bet_reference   = 2;  // human-readable: BET-2024-XJKP9
+  int64  potential_payout_minor_units = 3;
+}
+
+message SelectionInput {
+  string market_id   = 1;
+  string outcome_id  = 2;
+  int64  quoted_odds_decimal_millis = 3;  // 2.50 → 2500
+}
+
+message CashoutStreamRequest { string bet_id = 1; }
+message CashoutValueUpdate {
+  string bet_id = 1;
+  int64  current_value_minor_units = 2;
+  bool   available = 3;  // false = stream complete, cashout no longer offered
+}
+
+// ── Wallet service proto ──────────────────────────────────────────────────────
+service WalletService {
+  rpc ReserveStake       (ReserveStakeRequest)   returns (ReserveStakeResponse);
+  rpc ReleaseReservation (ReleaseRequest)        returns (ReleaseResponse);
+  rpc CreditWinnings     (CreditRequest)         returns (CreditResponse);
+  rpc GetBalance         (GetBalanceRequest)     returns (BalanceResponse);
+}
+
+message ReserveStakeRequest {
+  string user_id            = 1;
+  int64  amount_minor_units = 2;
+  string currency           = 3;
+  string idempotency_key    = 4;  // prevents double-debit on retry
+}
+message ReserveStakeResponse { bool success = 1; int64 available_after_minor_units = 2; }`
+
+S.grpcService = `// apps/betting-service/src/modules/betting/betting.grpc.controller.ts
+// gRPC transport layer — translates protobuf messages to domain Commands.
+// No business logic here. The controller is thin: deserialise → command → result.
+
+@Controller()
+export class BettingGrpcController {
+  constructor(
+    private readonly commandBus: CommandBus,
+    private readonly queryBus: QueryBus,
+  ) {}
+
+  // ── Unary RPC ────────────────────────────────────────────────────────────
+  // @GrpcMethod(protoServiceName, rpcMethodName)
+  // protoServiceName MUST exactly match the service {} block in the .proto file.
+  // Returns a plain object — NestJS serialises it to a protobuf response frame.
+  @GrpcMethod('BettingService', 'PlaceBet')
+  async placeBet(data: PlaceBetRequest, metadata: Metadata): Promise<PlaceBetResponse> {
+    // Extract correlation ID propagated by the API Gateway in gRPC metadata
+    const correlationId = metadata.get('x-correlation-id')[0]?.toString() ?? randomUUID();
+
+    // Build the domain command from the protobuf message fields
+    const command = new PlaceBetCommand(
+      data.userId, data.operatorId, data.betType as BetType,
+      data.selections, data.stakeMinorUnits, data.oddsAcceptance as OddsAcceptance,
+      data.currency, data.idempotencyKey, correlationId, data.freeBetTokenId,
+    );
+
+    const result = await this.commandBus.execute(command);
+    return { betId: result.betId, betReference: result.betReference, potentialPayoutMinorUnits: 0 };
+  }
+
+  // ── Server-streaming RPC ─────────────────────────────────────────────────
+  // Returns Observable<T>. NestJS emits each item as a separate protobuf frame.
+  // The stream closes when the Observable completes.
+  // Client sets a deadline on the call — NestJS respects gRPC deadlines automatically.
+  @GrpcStreamMethod('BettingService', 'StreamCashoutValues')
+  streamCashoutValues(data: CashoutStreamRequest, metadata: Metadata): Observable<CashoutValueUpdate> {
+    return new Observable(observer => {
+      const timer = setInterval(async () => {
+        // const value = await this.cashoutCalc.calculate(data.betId);
+        // if (!value.available) { observer.complete(); clearInterval(timer); return; }
+        // observer.next({ betId: data.betId, currentValueMinorUnits: value.amount, available: true });
+      }, 2_000); // recalculate and push every 2 seconds
+
+      // Cleanup on client disconnect or stream error
+      return () => clearInterval(timer);
+    });
+  }
+}
+
+// ── apps/betting-service/src/main.ts — Hybrid app (HTTP + gRPC + Kafka) ──────
+// connectMicroservice() registers additional transport layers.
+// startAllMicroservices() must be called BEFORE app.listen().
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // Transport 1: gRPC — sync service-to-service RPCs
+  app.connectMicroservice<MicroserviceOptions>({
+    transport: Transport.GRPC,
+    options: {
+      package:   'betting.v1',
+      protoPath: join(__dirname, '../../../libs/proto/betting.proto'),
+      url: '0.0.0.0:5001',
+      // Keepalive prevents load balancers from closing idle gRPC connections
+      // keepalive: { keepaliveTimeMs: 10_000, keepalivePermitWithoutCalls: 1 }
+      // mTLS in prod: credentials.createSsl(rootCert, privateKey, certChain)
+    },
+  });
+
+  // Transport 2: Kafka — async event consumption
+  app.connectMicroservice<MicroserviceOptions>({
+    transport: Transport.KAFKA,
+    options: {
+      client: { brokers: process.env.KAFKA_BROKERS?.split(',') ?? ['localhost:9092'] },
+      consumer: {
+        groupId: 'betting-service-v1',  // versioned: new version = new group = replay from head
+        allowAutoTopicCreation: false,  // never silently create a topic on typo
+      },
+      run: { autoCommit: false },  // manual offset commit: at-least-once delivery
+    },
+  });
+
+  await app.startAllMicroservices();
+  await app.listen(3001);  // HTTP health/metrics on 3001, gRPC on 5001
+}`
+
+S.jwtStrategy = `// apps/auth-service/src/modules/auth/strategies/jwt.strategy.ts
+// Passport strategy invoked by AuthGuard('jwt') on every non-public request.
+// It handles: token extraction → signature verification → payload decoding.
+// The guard then runs additional checks (blacklist, version, self-exclusion).
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
+  constructor(private readonly config: ConfigService) {
+    super({
+      // ── Key source ────────────────────────────────────────────────────────
+      // Development: simple HS256 shared secret
+      // Production:  RS256 asymmetric. Private key only in auth-service.
+      //              All other services fetch the public key via JWKS endpoint.
+      //              A compromised downstream service cannot forge tokens.
+      secretOrKeyProvider: config.get('NODE_ENV') === 'production'
+        ? passportJwtSecret({
+            cache: true,
+            rateLimit: true,
+            jwksRequestsPerMinute: 5,
+            // JWKS endpoint served by auth-service: /api/v1/auth/.well-known/jwks.json
+            // Contains public key(s). Multiple keys support zero-downtime key rotation.
+            jwksUri: config.getOrThrow('JWKS_URI'),
+          })
+        : (_req: Request, _rawJwt: string, done: (err: null, secret: string) => void) => {
+            done(null, config.getOrThrow('JWT_SECRET'));
+          },
+
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      ignoreExpiration: false,    // NEVER set true — would accept expired tokens
+      algorithms: config.get('NODE_ENV') === 'production' ? ['RS256'] : ['HS256'],
+      audience: config.get('JWT_AUDIENCE', 'betting-platform-api'),
+      issuer:   config.get('JWT_ISSUER',   'betting-platform-auth'),
+    });
+  }
+
+  // Return value becomes req.user — available in all downstream guards and handlers.
+  // Minimal validation here; business checks (blacklist, version) live in JwtAuthGuard.
+  async validate(payload: JwtPayload): Promise<JwtPayload> {
+    if (!payload.sub || !payload.roles)
+      throw new UnauthorizedException({ code: 'INVALID_TOKEN_PAYLOAD' });
+    return payload;
+  }
+}
+
+// ── JWT Payload shape ─────────────────────────────────────────────────────────
+// Embedded in every request — keep it small.
+// Do NOT embed fine-grained permissions (too large); embed roles only.
+// Add jti for blacklisting and tokenVersion for forced re-auth.
+export interface JwtPayload {
+  sub:          string;      // userId (UUID) — the primary identity
+  email:        string;      // display only; NEVER use for business logic (mutable)
+  roles:        UserRole[];  // coarse-grained RBAC
+  operatorId?:  string;      // white-label operator context
+  kycStatus:    KycStatus;   // drives deposit/withdrawal limits inline (avoids DB lookup)
+  jti:          string;      // JWT ID — used to blacklist this specific token
+  tokenVersion: number;      // increment to invalidate all tokens for this user
+  iat: number;
+  exp: number;
+}
+
+// ── Auth Controller: login / refresh / logout ─────────────────────────────────
+@Controller({ path: 'auth', version: '1' })
+export class AuthController {
+  // POST /api/v1/auth/login
+  // Returns: accessToken in body (15min), refreshToken in HttpOnly cookie (30d)
+  @Post('login')
+  @Public()
+  @HttpCode(200)
+  async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
+    // const result = await this.authService.login(dto.email, dto.password);
+    // Set refresh token as HttpOnly cookie — inaccessible to JavaScript (XSS-safe)
+    // res.cookie('refresh_token', result.refreshToken, {
+    //   httpOnly: true, secure: true, sameSite: 'strict',
+    //   maxAge: 30 * 24 * 60 * 60 * 1000,
+    //   path: '/api/v1/auth/refresh', // scoped: not sent on every request
+    // });
+    // return { accessToken: result.accessToken, expiresIn: 900 };
+  }
+
+  // POST /api/v1/auth/refresh
+  // Single-use rotation: old token deleted, new token issued atomically
+  @Post('refresh')
+  @Public()
+  @HttpCode(200)
+  async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+    // const refreshToken = req.cookies['refresh_token'];
+    // const result = await this.sessionService.validateAndRotateRefreshToken(...);
+    // if (!result) throw new UnauthorizedException({ code: 'REFRESH_TOKEN_INVALID' });
+    // return { accessToken: result.newAccessToken };
+  }
+
+  // POST /api/v1/auth/logout
+  @Post('logout')
+  @HttpCode(204)
+  async logout(@CurrentUser() user: JwtPayload) {
+    // Blacklist the current access token with TTL = remaining lifetime
+    // await this.sessionService.blacklistAccessToken(user.jti, remainingMs);
+    // Delete the refresh token from Redis
+    // res.clearCookie('refresh_token');
+  }
+}`
+
+S.typeormModule = `// libs/database/src/database.module.ts
+// TypeORM module: connection pooling, read replicas, schema-per-service isolation,
+// migration runner, and fail-fast validation at startup.
+
+@Global()
+@Module({
+  imports: [
+    TypeOrmModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService): TypeOrmModuleOptions => ({
+        type: 'postgres',
+        host:     config.getOrThrow('DB_HOST'),
+        port:     config.get<number>('DB_PORT', 5432),
+        username: config.getOrThrow('DB_USERNAME'),
+        password: config.getOrThrow('DB_PASSWORD'),
+        database: config.getOrThrow('DB_NAME'),
+
+        // ── Schema-per-service isolation ──────────────────────────────────
+        // Each service owns its schema: betting, wallet, auth, risk.
+        // This prevents cross-service table joins at the DB level.
+        // schema: config.get('DB_SCHEMA', 'betting'),
+
+        // ── Connection pool ────────────────────────────────────────────────
+        // Rule of thumb for Postgres: (num_cores × 2) + effective_spindle_count
+        // 4-core container → pool of ~10.
+        // Beyond 200 active connections → use PgBouncer in transaction mode.
+        extra: {
+          max: config.get<number>('DB_POOL_MAX', 10),
+          min: config.get<number>('DB_POOL_MIN', 2),
+          idleTimeoutMillis:    30_000,
+          connectionTimeoutMillis: 5_000,
+          // Per-statement guardrails (enforced by PostgreSQL itself)
+          statement_timeout: '30s',  // kill runaway queries
+          lock_timeout:      '5s',   // fast-fail on contention vs hang forever
+        },
+
+        entities:   [__dirname + '/../../**/*.entity{.ts,.js}'],
+        migrations: [__dirname + '/../../migrations/*{.ts,.js}'],
+
+        // NEVER true in production — TypeORM drops columns to match entities.
+        // One accidental column rename = irreversible data loss.
+        synchronize: false,
+
+        // Run pending migrations at startup. Idempotent IF your migrations use
+        // IF NOT EXISTS / IF EXISTS — safe in blue/green deployments.
+        migrationsRun: config.get('NODE_ENV') !== 'test',
+
+        logging:              config.get('NODE_ENV') === 'development' ? ['query', 'error'] : ['error'],
+        maxQueryExecutionTime: 5_000, // log slow queries > 5s (not kill — statement_timeout does that)
+      }),
+    }),
+  ],
+  exports: [TypeOrmModule],
+})
+export class DatabaseModule {
+  static forFeature(entities: EntityClassOrSchema[]) {
+    return TypeOrmModule.forFeature(entities);
+  }
+}`
+
+S.baseEntity = `// libs/database/src/base.entity.ts
+// All entities extend BaseEntity — centralises audit columns and optimistic locking.
+
+@Entity()
+export abstract class BaseEntity {
+  // UUID v4: globally unique, no sequential guessing, safe in public URLs.
+  // (BIGSERIAL would expose row count and insertion rate to competitors.)
+  @PrimaryGeneratedColumn('uuid')
+  id: string;
+
+  @CreateDateColumn({ name: 'created_at', type: 'timestamptz' })
+  createdAt: Date;
+
+  @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' })
+  updatedAt: Date;
+
+  // Optimistic locking — TypeORM auto-increments on every UPDATE.
+  // Two processes read version=5 → both try UPDATE WHERE version=5
+  // → one succeeds, the other gets OptimisticLockVersionMismatchError.
+  // Prevents: concurrent cashout + auto-settlement updating the same bet row.
+  @VersionColumn({ name: 'version', default: 0 })
+  version: number;
+}
+
+// ── TypeORM Migration example ─────────────────────────────────────────────────
+// Migrations are an immutable changelog — never edit existing migrations.
+// Create a new one: npx typeorm migration:create src/migrations/AddRgSnapshotToBets
+// Naming convention: {timestamp}_{description}
+
+export class AddRgSnapshotToBets1710000000000 implements MigrationInterface {
+  async up(queryRunner: QueryRunner): Promise<void> {
+    // ADD COLUMN is fast on PG (no table rewrite for nullable columns)
+    await queryRunner.query(\`
+      ALTER TABLE betting.bets
+        ADD COLUMN IF NOT EXISTS rg_snapshot JSONB,
+        ADD COLUMN IF NOT EXISTS operator_id UUID;
+    \`);
+
+    // CONCURRENTLY: builds index without holding an ACCESS EXCLUSIVE lock.
+    // Safe in production — reads and writes continue while the index builds.
+    // Cannot run inside a transaction — must be its own query.
+    await queryRunner.query(\`
+      CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_bets_user_operator
+        ON betting.bets (user_id, operator_id, created_at DESC);
+    \`);
+  }
+
+  async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(\`DROP INDEX IF EXISTS betting.idx_bets_user_operator\`);
+    await queryRunner.query(\`
+      ALTER TABLE betting.bets
+        DROP COLUMN IF EXISTS rg_snapshot,
+        DROP COLUMN IF EXISTS operator_id;
+    \`);
+  }
+}`
+
+S.walletEntity = `// apps/wallet-service/src/domain/entities/wallet.entity.ts
+// Financial ledger — the most consistency-critical entity in the system.
+// All values: BIGINT minor units. No nullable balances — default to 0.
+// @Check constraints are enforced by PostgreSQL even if the ORM is bypassed.
+
+@Entity({ name: 'wallets', schema: 'wallet' })
+@Index('idx_wallets_user', ['userId'], { unique: true })
+@Check(\`"real_balance_minor_units" >= 0\`)
+@Check(\`"in_play_stake_minor_units" >= 0\`)
+export class Wallet extends BaseEntity {
+  @Column({ name: 'user_id', type: 'uuid', unique: true }) userId: string;
+  @Column({ name: 'operator_id', type: 'uuid' }) operatorId: string;
+  @Column({ type: 'enum', enum: Currency }) currency: Currency;
+
+  // Real money deposited by the user
+  @Column({ name: 'real_balance_minor_units', type: 'bigint', default: 0 })
+  realBalanceMinorUnits: number;
+
+  // Bonus: wagering requirements apply, cannot withdraw directly
+  @Column({ name: 'bonus_balance_minor_units', type: 'bigint', default: 0 })
+  bonusBalanceMinorUnits: number;
+
+  // Funds escrowed for open bets: realBalance - inPlayStake = withdrawable balance
+  @Column({ name: 'in_play_stake_minor_units', type: 'bigint', default: 0 })
+  inPlayStakeMinorUnits: number;
+
+  // AML: frozen wallets can deposit but cannot withdraw (suspicious activity)
+  @Column({ name: 'is_frozen', type: 'boolean', default: false }) isFrozen: boolean;
+
+  // Computed (not persisted) — only ever read from this getter, never calculated inline
+  get availableBalanceMinorUnits(): number {
+    return this.realBalanceMinorUnits - this.inPlayStakeMinorUnits;
+  }
+}
+
+// ── WalletTransaction entity — immutable ledger ───────────────────────────────
+// Never UPDATE or DELETE transaction rows.
+// Every balance change produces one append-only transaction record.
+// The idempotency_key prevents duplicate credits if the bet settlement retries.
+
+@Entity({ name: 'wallet_transactions', schema: 'wallet' })
+@Index('idx_wallet_txns_wallet_date', ['walletId', 'createdAt'])
+export class WalletTransaction extends BaseEntity {
+  @Column({ name: 'wallet_id', type: 'uuid' }) walletId: string;
+
+  @Column({ type: 'enum', enum: TransactionType })
+  type: TransactionType;  // DEPOSIT | WITHDRAWAL | STAKE_RESERVE | WINNINGS_CREDIT
+
+  // Always positive — direction is implied by the type enum
+  @Column({ name: 'amount_minor_units', type: 'bigint' }) amountMinorUnits: number;
+
+  // betId, depositId, withdrawalId — what triggered this transaction
+  @Column({ name: 'reference_id', type: 'uuid' }) referenceId: string;
+
+  // Prevents duplicate credits on retry: INSERT ... ON CONFLICT (idempotency_key) DO NOTHING
+  @Column({ name: 'idempotency_key', type: 'varchar', length: 64, unique: true })
+  idempotencyKey: string;
+
+  // Snapshot for audit: "balance was 5000, this credit of 500 made it 5500"
+  @Column({ name: 'balance_before_minor_units', type: 'bigint' }) balanceBeforeMinorUnits: number;
+  @Column({ name: 'balance_after_minor_units',  type: 'bigint' }) balanceAfterMinorUnits: number;
+}`
+
+S.rgService = `// apps/risk-service/src/modules/risk/rg-limit.service.ts
+// Responsible Gambling (RG) — mandatory for every licensed gambling operator.
+// UKGC, MGA, and most European jurisdictions require:
+//   • Deposit / loss / stake limits (daily, weekly, monthly)
+//   • Session time limits (e.g. max 4h continuous play)
+//   • Mandatory cooling-off periods (cannot reduce self-exclusion early)
+//   • Self-exclusion (permanent or time-limited account ban)
+//   • Reality checks (pop-up after 1h: "You've been playing for X hours")
+//
+// Architecture: limits stored in DB (source of truth) + Redis (hot cache for bet path).
+// Limit checks on every bet: O(1) Redis lookup, never a DB query on the hot path.
+
+@Injectable()
+export class RgLimitService {
+  // ── Check limits before allowing a bet ───────────────────────────────────
+  async checkBetLimits(params: {
+    userId: string;
+    stakeMinorUnits: number;
+    currency: string;
+  }): Promise<{ allowed: boolean; reason?: string; limitType?: string }> {
+    const [dailyUsed, weeklyUsed, limits] = await Promise.all([
+      this.redis.get<number>(\`rg:stake:daily:\${params.userId}\`),
+      this.redis.get<number>(\`rg:stake:weekly:\${params.userId}\`),
+      this.getUserLimitsFromCache(params.userId),
+    ]);
+
+    if (limits?.maxStakePerBet && params.stakeMinorUnits > limits.maxStakePerBet)
+      return { allowed: false, reason: 'Stake exceeds per-bet limit', limitType: 'STAKE_PER_BET' };
+
+    if (limits?.dailyStakeLimit && ((dailyUsed ?? 0) + params.stakeMinorUnits) > limits.dailyStakeLimit)
+      return { allowed: false, reason: 'Daily stake limit reached', limitType: 'DAILY_STAKE' };
+
+    if (limits?.weeklyStakeLimit && ((weeklyUsed ?? 0) + params.stakeMinorUnits) > limits.weeklyStakeLimit)
+      return { allowed: false, reason: 'Weekly stake limit reached', limitType: 'WEEKLY_STAKE' };
+
+    // Session time check: RG timer started on login, checked on each bet
+    // const sessionMins = await this.redis.get<number>(\`rg:session:\${userId}\`);
+    // if (limits?.sessionTimeLimitMins && (sessionMins ?? 0) > limits.sessionTimeLimitMins)
+    //   return { allowed: false, reason: 'Session time limit reached', limitType: 'SESSION_TIME' };
+
+    return { allowed: true };
+  }
+
+  // ── Self-exclusion: set a permanent or time-limited account ban ───────────
+  // CANNOT be reversed before the cooling-off period (UKGC: minimum 6 months).
+  // This is enforced at: JwtAuthGuard, bet placement, deposit, and game launch.
+  async setSelfExclusion(userId: string, durationDays: number | 'permanent'): Promise<void> {
+    const key = \`u:excl:\${userId}\`;
+    if (durationDays === 'permanent') {
+      await this.redis.set(key, 'permanent');   // no TTL — permanent
+    } else {
+      await this.redis.set(key, 'excluded', durationDays * 86_400);
+    }
+    // Saga: cancel all open bets (void, refund stake), freeze deposits, send email
+    await this.eventBus.publish(new UserSelfExcludedEvent(userId, durationDays));
+  }
+
+  // ── Deposit limit change with cooling-off ─────────────────────────────────
+  // Reducing limits → effective IMMEDIATELY (protective: user wants less risk)
+  // Increasing limits → 24h cooling-off period (prevents impulsive reversal)
+  async updateDepositLimit(userId: string, newLimitMinorUnits: number): Promise<void> {
+    // const current = await this.getUserDepositLimit(userId);
+    // if (newLimitMinorUnits > current) {
+    //   await this.db.save(PendingLimitChange, { userId, newLimit, effectiveAt: addHours(now(), 24) });
+    //   return; // scheduled job applies it after 24h
+    // }
+    // await this.applyLimitImmediately(userId, newLimitMinorUnits);
+  }
+}`
+
+S.otelTracing = `// libs/telemetry/src/tracing.init.ts
+// ⚡ MUST be the very first import in main.ts
+// OpenTelemetry SDK monkey-patches modules at load time.
+// If pg / ioredis / kafkajs load before the SDK, they cannot be instrumented
+// and you get no database/cache/queue spans in your traces.
+
+import { NodeSDK } from '@opentelemetry/sdk-node';
+import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-http';
+import { Resource } from '@opentelemetry/resources';
+import { SEMRESATTRS_SERVICE_NAME, SEMRESATTRS_SERVICE_VERSION } from '@opentelemetry/semantic-conventions';
+import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
+import { IORedisInstrumentation } from '@opentelemetry/instrumentation-ioredis';
+import { KafkaJsInstrumentation } from '@opentelemetry/instrumentation-kafkajs';
+import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
+import { GrpcInstrumentation } from '@opentelemetry/instrumentation-grpc';
+
+const sdk = new NodeSDK({
+  resource: new Resource({
+    [SEMRESATTRS_SERVICE_NAME]:    process.env.SERVICE_NAME    ?? 'api-gateway',
+    [SEMRESATTRS_SERVICE_VERSION]: process.env.npm_package_version ?? '0.0.0',
+    'deployment.environment':      process.env.NODE_ENV        ?? 'development',
+  }),
+
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT ?? 'http://localhost:4318/v1/traces',
+  }),
+
+  // ── Auto-instrumentation ────────────────────────────────────────────────────
+  // Each plugin wraps the library to emit spans automatically.
+  // pg → span per SQL query (includes table name, row count)
+  // ioredis → span per Redis command
+  // kafkajs → span per produce/consume
+  // http / grpc → span per incoming and outgoing request
+  instrumentations: [
+    new HttpInstrumentation({
+      // Ignore health check probes — they generate noise without insight
+      ignoreIncomingRequestHook: (req) => req.url?.includes('/health') ?? false,
+    }),
+    new GrpcInstrumentation(),
+    new PgInstrumentation({ enhancedDatabaseReporting: false }), // false = no SQL params in spans (PII)
+    new IORedisInstrumentation(),
+    new KafkaJsInstrumentation(),
+  ],
+});
+
+sdk.start();
+// Flush pending spans before process exits (k8s SIGTERM / graceful shutdown)
+process.on('SIGTERM', () => sdk.shutdown());
+
+// ── TracingInterceptor ─────────────────────────────────────────────────────────
+// Creates a named span for every NestJS controller handler.
+// Auto-instrumentation handles DB/Redis/Kafka child spans inside.
+// The interceptor provides the application-level root span with business context.
+
+@Injectable()
+export class TracingInterceptor implements NestInterceptor {
+  intercept(ctx: ExecutionContext, next: CallHandler): Observable<any> {
+    const tracer = trace.getTracer('nestjs-handler');
+    const handlerName = \`\${ctx.getClass().name}.\${ctx.getHandler().name}\`;
+
+    // startActiveSpan: makes this span the parent for all child spans created within
+    return new Observable(subscriber => {
+      tracer.startActiveSpan(handlerName, { kind: SpanKind.INTERNAL }, (span) => {
+        const req = ctx.switchToHttp().getRequest();
+        span.setAttributes({
+          'http.method':       req.method,
+          'http.route':        req.route?.path ?? req.url,
+          'user.id':           req.user?.sub   ?? 'anonymous',
+          'correlation.id':    req.headers['x-correlation-id'] ?? '',
+        });
+
+        next.handle().pipe(
+          tap(() => { span.setStatus({ code: SpanStatusCode.OK }); span.end(); }),
+          catchError((err) => {
+            span.recordException(err);
+            span.setStatus({ code: SpanStatusCode.ERROR, message: err.message });
+            span.end();
+            return throwError(() => err);
+          }),
+        ).subscribe(subscriber);
+      });
+    });
+  }
+}`
+
+S.pinoConfig = `// Pino structured logging — configured in AppModule's LoggerModule.forRootAsync()
+// Pino is 5× faster than Winston for high-throughput JSON output.
+// Every log line is a valid JSON object, ingested directly by Datadog/Loki/CloudWatch.
+
+LoggerModule.forRootAsync({
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    pinoHttp: {
+      level: config.get('NODE_ENV') === 'production' ? 'info' : 'trace',
+
+      // ── PII Redaction ───────────────────────────────────────────────────
+      // GDPR Article 25: privacy by design. These paths are scrubbed
+      // from every log entry before it is written to any transport.
+      redact: {
+        paths: [
+          'req.headers.authorization',    // Bearer token
+          'req.headers.cookie',           // session cookie
+          'req.body.password',
+          'req.body.cardNumber',
+          'req.body.iban',
+          'req.body.cvv',
+          'res.headers["set-cookie"]',
+        ],
+        censor: '[REDACTED]',
+      },
+
+      // ── Request/response serialisers ─────────────────────────────────────
+      // Define EXACTLY what gets logged. Default serialisers include too much.
+      serializers: {
+        req: (req) => ({
+          method:        req.method,
+          url:           req.url,
+          correlationId: req.headers['x-correlation-id'],
+          userAgent:     req.headers['user-agent'],
+          // NEVER: IP address (PII), full headers, full body
+        }),
+        res: (res) => ({ statusCode: res.statusCode }),
+      },
+
+      // Dev: pretty-print for human readability.
+      // In production: remove entirely (perf overhead, breaks JSON ingestion)
+      transport: config.get('NODE_ENV') !== 'production'
+        ? { target: 'pino-pretty', options: { colorize: true, translateTime: 'SYS:standard' } }
+        : undefined,
+
+      // Auto-logged fields on every HTTP request/response:
+      //   req.method, req.url, res.statusCode, responseTime (ms), correlationId
+      customSuccessMessage: () => 'request completed',
+      customErrorMessage:   (_req, res) => \`request failed with status \${res.statusCode}\`,
+    },
+  }),
+})
+
+// ── Structured log output (example JSON line) ─────────────────────────────────
+// {
+//   "level":         30,
+//   "time":          1710000000000,
+//   "pid":           1,
+//   "correlationId": "7f3c2a1b-...",
+//   "userId":        "a9b8c7d6-...",
+//   "method":        "POST",
+//   "url":           "/api/v1/bets",
+//   "statusCode":    201,
+//   "responseTime":  23,
+//   "msg":           "request completed"
+// }
+//
+// Every field is queryable in Datadog/Grafana Loki with zero parsing configuration.`
+
+S.bullmqQueues = `// apps/notification-service/src/app.module.ts
+// BullMQ priority queues: critical notifications never wait behind marketing emails.
+// Three separate queues with different retry policies and priority levels.
+
+@Module({
+  imports: [
+    BullModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        connection: {
+          host:     config.getOrThrow('REDIS_HOST'),
+          port:     config.get<number>('REDIS_PORT', 6379),
+          password: config.get('REDIS_PASSWORD'),
+          // ⚠ Use a dedicated Redis DB for queues (db: 1).
+          // Cache uses allkeys-lru eviction policy — which would silently delete queued jobs.
+          db: 1,
+        },
+        defaultJobOptions: {
+          attempts: 3,
+          backoff: { type: 'exponential', delay: 5_000 }, // 5s, 10s, 20s
+          removeOnComplete: { count: 1_000 },  // keep for debugging
+          removeOnFail:     { count: 5_000 },  // keep failed jobs for inspection
+        },
+      }),
+    }),
+
+    // Three queues, lowest number = highest priority
+    BullModule.registerQueue(
+      { name: 'notification:critical',      defaultJobOptions: { priority: 1, attempts: 5 } },
+      { name: 'notification:transactional', defaultJobOptions: { priority: 2, attempts: 3 } },
+      { name: 'notification:marketing',     defaultJobOptions: { priority: 3, attempts: 2 } },
+    ),
+  ],
+  providers: [NotificationProducer, NotificationProcessor, EmailService, SmsService, PushService],
+})
+export class NotificationModule {}
+
+// ── Notification Processor ─────────────────────────────────────────────────────
+@Processor('notification:transactional')
+export class NotificationProcessor extends WorkerHost {
+  // process() is called by BullMQ worker for each dequeued job.
+  // If it throws, BullMQ will retry according to the backoff policy.
+  async process(job: Job<NotificationJob>): Promise<void> {
+    const { userId, type, data, channels } = job.data;
+
+    // Fan-out: same event → multiple channels based on user preferences
+    const deliveries = channels.map(channel => {
+      switch (channel) {
+        case 'email': return this.emailService.send({ userId, template: type, data });
+        case 'sms':   return this.smsService.send({ userId, message: data.shortMessage });
+        case 'push':  return this.pushService.send({ userId, title: data.title, body: data.body });
+        default:      return Promise.resolve();
+      }
+    });
+
+    // Promise.allSettled: if email fails, push/SMS still deliver.
+    // Never use Promise.all here — one channel failure would block the others.
+    const results = await Promise.allSettled(deliveries);
+    const failures = results.filter(r => r.status === 'rejected');
+    if (failures.length > 0) {
+      // Partial failure: log but do NOT rethrow (avoids re-sending to channels that succeeded)
+      this.logger.warn({ jobId: job.id, failedChannels: failures.length }, 'Partial delivery failure');
+    }
+  }
+
+  // ── Worker event hooks ─────────────────────────────────────────────────────
+  @OnWorkerEvent('failed')
+  onFailed(job: Job, err: Error) {
+    // Exhausted all retries — alert on-call. NEVER silently drop transactional notifications.
+    if (job.attemptsMade >= (job.opts.attempts ?? 1)) {
+      this.logger.error({ jobId: job.id, type: job.data.type, err: err.message }, 'Job dead-lettered');
+      // this.alertingService.page('notification-dlq', { jobId: job.id });
+    }
+  }
+
+  @OnWorkerEvent('stalled')
+  onStalled(jobId: string) {
+    // Stalled = worker died mid-processing. BullMQ auto-retries but log it.
+    this.logger.warn({ jobId }, 'Job stalled — worker likely crashed');
+  }
+}`
+
+S.pipes = `// Pipes: transform and validate data BEFORE it reaches the handler.
+// Applied in this order: Global → Controller-level → Route-level → Parameter-level.
+// NestJS built-in pipes: ValidationPipe, ParseIntPipe, ParseUUIDPipe,
+//   ParseBoolPipe, ParseArrayPipe, DefaultValuePipe.
+
+// ── Global ValidationPipe (configured in main.ts) ──────────────────────────
+app.useGlobalPipes(new ValidationPipe({
+  // Strip properties not defined on the DTO class.
+  // Prevents mass-assignment attacks where attacker sends unexpected fields.
+  whitelist: true,
+
+  // Throw 400 instead of silently stripping (loud failure > silent permissiveness)
+  forbidNonWhitelisted: true,
+
+  // Coerce types: "?page=1" (string) → 1 (number) when @Type(() => Number) is set.
+  // Eliminates manual parseInt() in every query handler.
+  transform: true,
+  transformOptions: { enableImplicitConversion: true },
+
+  // Structured error response instead of NestJS default:
+  //   { "statusCode": 400, "message": ["stakeMinorUnits must be positive"] }
+  exceptionFactory: (errors: ValidationError[]) => new BadRequestException({
+    code: 'VALIDATION_ERROR',
+    fields: errors.map(e => ({
+      field: e.property,
+      constraints: Object.values(e.constraints ?? {}),
+      children: e.children?.map(c => c.property) ?? [],
+    })),
+  }),
+}));
+
+// ── class-validator decorators on a real DTO ─────────────────────────────────
+export class GetBetsQueryDto {
+  @IsOptional()
+  @IsString()
+  cursor?: string;  // opaque base64 pagination cursor
+
+  @IsOptional()
+  @Type(() => Number)     // transform "20" → 20 (needs transform: true in ValidationPipe)
+  @IsInt()
+  @Min(1) @Max(100)
+  limit: number = 20;     // DefaultValuePipe alternative: @DefaultValuePipe(20)
+
+  @IsOptional()
+  @IsEnum(BetStatus)
+  status?: BetStatus;
+
+  @IsOptional()
+  @IsDateString()         // validates ISO 8601: "2024-03-15T10:00:00Z"
+  fromDate?: string;
+
+  @IsOptional()
+  @IsEnum(Currency)
+  currency?: Currency;
+}
+
+// ── Custom pipe: decode and validate an opaque pagination cursor ─────────────
+@Injectable()
+export class ParseCursorPipe implements PipeTransform {
+  transform(value: string | undefined): { createdAt: string; betId: string } | null {
+    if (!value) return null;
+    try {
+      const decoded = Buffer.from(value, 'base64').toString('utf-8');
+      const cursor = JSON.parse(decoded);
+      if (!cursor.createdAt || !cursor.betId) throw new Error('missing fields');
+      return cursor;
+    } catch {
+      throw new BadRequestException({
+        code: 'INVALID_CURSOR',
+        message: 'Pagination cursor is malformed or tampered',
+      });
+    }
+  }
+}
+
+// Usage: @Query('cursor', ParseCursorPipe) cursor: CursorToken | null
+
+// ── @ValidateNested + @Type: nested DTO validation ───────────────────────────
+// Without @Type(), class-transformer doesn't know to deserialise the nested object.
+// Without @ValidateNested(), class-validator skips nested validation entirely.
+export class PlaceBetDto {
+  @IsArray()
+  @ValidateNested({ each: true })   // validate each element in the array
+  @Type(() => BetSelectionDto)      // deserialise each element as BetSelectionDto
+  @ArrayMinSize(1)
+  @ArrayMaxSize(20)
+  selections: BetSelectionDto[];
+}`
+
+S.lifecycleHooks = `// NestJS Module Lifecycle & Health Checks
+//
+// ── STARTUP execution order ────────────────────────────────────────────────────
+// 1. All provider constructors run (DI graph resolved)
+// 2. onModuleInit()          — per provider, in dependency order
+// 3. onApplicationBootstrap() — after ALL modules have initialised
+// 4. HTTP server / gRPC transport starts accepting connections
+//
+// ── SHUTDOWN execution order (triggered by app.enableShutdownHooks() + SIGTERM) ─
+// 1. onModuleDestroy()            — per provider (clean up resources)
+// 2. beforeApplicationShutdown()  — last chance before connections close
+// 3. HTTP server stops accepting new connections
+// 4. In-flight requests drain (k8s terminationGracePeriodSeconds window)
+// 5. Process exits
+
+@Injectable()
+export class KafkaProducerService implements OnModuleInit, OnModuleDestroy {
+  private producer: Producer;
+
+  // onModuleInit: called once all DI providers are constructed.
+  // Use for: opening connections, loading config caches, warming up pools.
+  async onModuleInit(): Promise<void> {
+    this.producer = this.kafka.producer({
+      idempotent: true,            // exactly-once within Kafka producer session
+      maxInFlightRequests: 5,
+    });
+    await this.producer.connect();
+    this.logger.log('Kafka producer connected');
+  }
+
+  // onModuleDestroy: called when app receives SIGTERM (k8s rolling deploy).
+  // flush() waits for any pending messages before disconnecting.
+  // app.enableShutdownHooks() in main.ts MUST be called or this hook never fires.
+  async onModuleDestroy(): Promise<void> {
+    this.logger.log('Flushing Kafka producer...');
+    await this.producer.flush({ timeout: 5_000 });
+    await this.producer.disconnect();
+  }
+}
+
+// ── Health checks with @nestjs/terminus ──────────────────────────────────────
+// Kubernetes liveness probe: is the process alive? (restart if not)
+// Kubernetes readiness probe: is it ready to serve? (remove from load balancer if not)
+// A readiness probe that returns 503 during DB reconnection prevents request loss.
+
+@Controller('health')
+export class HealthController {
+  constructor(
+    private health: HealthCheckService,
+    private db: TypeOrmHealthIndicator,
+  ) {}
+
+  // Readiness: all critical dependencies must be healthy
+  @Get('ready')
+  @HealthCheck()
+  ready() {
+    return this.health.check([
+      () => this.db.pingCheck('database', { timeout: 2_000 }),
+      // () => this.redis.isHealthy('redis'),
+      // () => this.kafka.isConnected('kafka'),
+    ]);
+    // Returns HTTP 200 { status: 'ok', ... } or 503 { status: 'error', ... }
+  }
+
+  // Liveness: just the process — a 503 triggers a pod restart
+  @Get('live')
+  live() {
+    return { status: 'ok', uptime: process.uptime() };
+  }
+}`
+
 // ─── Chapter definitions ──────────────────────────────────────────────────────
 export const chapters = [
   {
@@ -1657,6 +2735,225 @@ export const chapters = [
           { type: 'tip', icon: '🐳', title: 'Running locally', body: 'docker-compose up -d starts PostgreSQL, Redis, Kafka (2 brokers), Schema Registry, Debezium, Prometheus, Grafana, and Jaeger. Then run each service with: npm run start:{service-name}' },
         ],
         files: [{ filename: 'docker-compose.yml', lang: 'yaml', code: S.infrastructure }],
+      },
+    ],
+  },
+
+  // ── NEW CHAPTERS ────────────────────────────────────────────────────────────
+
+  {
+    id: 'di-decorators',
+    title: 'NestJS Core: Decorators & DI',
+    subtitle: 'How @Module, @Injectable, providers, and scopes actually work',
+    tag: { label: 'NestJS Core', color: '#58a6ff', bg: '#121d2f' },
+    description: 'Every NestJS feature — guards, interceptors, services — is built on two primitives: decorators (which attach metadata via Reflect.defineMetadata) and the DI container (which reads that metadata to wire up the object graph). Understanding these makes everything else click.',
+    sections: [
+      {
+        title: 'Core Decorators Reference',
+        description: '@Module describes the DI wiring. @Injectable marks a class as a provider. @Controller registers route handlers. Parameter decorators extract pieces of the request. SetMetadata + Reflector power all custom decorator patterns.',
+        callouts: [
+          { type: 'insight', icon: '🏗️', title: 'Decorators are just metadata', body: 'A decorator like @Injectable() calls Reflect.defineMetadata(\'injectable\', true, MyClass). At startup, NestJS scans every class in registered modules, reads this metadata, and builds the dependency graph. There is no magic — just metadata and a DI container.' },
+          { type: 'warning', icon: '⚠️', title: 'emitDecoratorMetadata must be true', body: 'Without "emitDecoratorMetadata": true in tsconfig.json, TypeScript does not emit constructor parameter type information. Injection silently fails — NestJS cannot resolve constructor dependencies.' },
+          { type: 'tip', icon: '💡', title: 'getAllAndOverride vs getAllAndMerge', body: 'getAllAndOverride: method-level decorator wins over class-level (use for @Roles, @Timeout). getAllAndMerge: combines both arrays (use when you want to accumulate values from both class and method). Wrong choice leads to subtle permission bypass bugs.' },
+        ],
+        files: [{ filename: 'NestJS Decorator Reference', lang: 'typescript', code: S.nestDecorators }],
+      },
+      {
+        title: 'Provider Patterns: useClass, useFactory, useValue, useExisting',
+        description: 'The DI container supports four provider shapes. useFactory with inject[] is the most powerful — it lets you run async setup code (connect to Redis, fetch remote config) before NestJS marks the module ready.',
+        callouts: [
+          { type: 'insight', icon: '🔄', title: 'useFactory is async-aware', body: 'NestJS awaits async factory functions before the module is ready to serve requests. This means you can open a Redis connection, wait for "ready" event, and the HTTP server will not start until it succeeds. Build-time dependency validation for free.' },
+          { type: 'critical', icon: '⚡', title: 'REQUEST scope bubble', body: 'Injecting a REQUEST-scoped service into a singleton makes that singleton REQUEST-scoped too — silently. The "scope bubble" cascades upward through the entire dependency chain. Profile with NestJS DevTools before adding REQUEST scope to shared services.' },
+          { type: 'pattern', icon: '🌍', title: '@Global() sparingly', body: 'Good candidates for @Global(): RedisModule, KafkaModule, TelemetryModule — true infrastructure that every module genuinely needs. Never @Global() a domain service (OddsService, BetService) — it destroys module boundaries and makes testing harder.' },
+        ],
+        files: [{ filename: 'Provider Patterns', lang: 'typescript', code: S.diProviders }],
+      },
+    ],
+  },
+
+  {
+    id: 'grpc',
+    title: 'gRPC: Service-to-Service Communication',
+    subtitle: 'Protocol Buffers, hybrid app setup, and streaming RPCs',
+    tag: { label: 'gRPC', color: '#f0883e', bg: '#271b0e' },
+    description: 'All synchronous inter-service calls use gRPC. Protobuf is 5-10× more compact than JSON, HTTP/2 multiplexing eliminates TCP overhead, and deadlines propagate automatically from parent to child calls. The betting-service exposes both a unary PlaceBet RPC and a server-streaming cashout values feed.',
+    sections: [
+      {
+        title: 'Protocol Buffer Contract',
+        description: 'The .proto file is the single source of truth for service communication. It is version-controlled, shared across services, and generates TypeScript types. Any change that breaks an existing consumer fails at compile time, not at runtime.',
+        callouts: [
+          { type: 'insight', icon: '⚡', title: 'Why gRPC over REST internally?', body: 'Protobuf encoding is 5-10× smaller than JSON. HTTP/2 multiplexing means dozens of concurrent RPCs over one TCP connection. gRPC deadlines propagate: if the API Gateway sets a 5s deadline, the betting-service gRPC call to wallet-service inherits a proportional sub-deadline automatically.' },
+          { type: 'critical', icon: '🔒', title: 'mTLS in production', body: 'Internal gRPC without mTLS means any process on the same network can call your financial services. Use mutual TLS: each service has a certificate, both sides verify identity. Istio service mesh can handle this automatically with SPIFFE/SPIRE.' },
+          { type: 'pattern', icon: '📦', title: 'int64 for all monetary fields', body: 'Protobuf float and double have the same IEEE 754 precision issues as JavaScript number. Use int64 (minor units) for all monetary fields. The payer\'s balance must not differ between the sender\'s encoding and the receiver\'s decoding.' },
+        ],
+        files: [{ filename: 'libs/proto/betting.proto', lang: 'protobuf', code: S.grpcProto }],
+      },
+      {
+        title: 'Hybrid App: gRPC + Kafka + HTTP',
+        description: 'NestJS hybrid apps attach multiple transports to a single NestJS application instance. The betting-service listens on three transports simultaneously: HTTP (health/metrics), gRPC (sync RPCs), and Kafka (async events). One DI container, three entry points.',
+        callouts: [
+          { type: 'warning', icon: '⚠️', title: 'startAllMicroservices before listen()', body: 'Always call startAllMicroservices() before app.listen(). If HTTP starts first, the Kubernetes readiness probe may succeed before gRPC is ready — the gateway will try to call a service that isn\'t listening yet.' },
+          { type: 'insight', icon: '🔁', title: 'Versioned Kafka consumer group', body: 'Using groupId: \'betting-service-v1\' means a new deployment creates a new consumer group. The old version finishes draining its partitions, then the new version picks up from the head. Zero-downtime redeployment without stopping Kafka consumption.' },
+        ],
+        files: [{ filename: 'Hybrid App + gRPC Controller', lang: 'typescript', code: S.grpcService }],
+      },
+    ],
+  },
+
+  {
+    id: 'auth-service',
+    title: 'Auth Service: JWT & Token Lifecycle',
+    subtitle: 'RS256 JWKS strategy, Passport, refresh rotation, and logout',
+    tag: { label: 'Auth', color: '#a371f7', bg: '#1f1535' },
+    description: 'The auth-service is the only issuer of JWTs. It uses RS256 asymmetric signing — all other services verify tokens using the public key from the JWKS endpoint without ever seeing the private key. This means a compromised downstream service cannot forge tokens.',
+    sections: [
+      {
+        title: 'JWT Strategy & Token Shape',
+        description: 'PassportStrategy extends the validate() method which runs after signature verification. Keep the JWT payload small — it travels in every request header. Embed roles and kycStatus to avoid DB lookups on every request, but not permissions (too granular and too large).',
+        callouts: [
+          { type: 'insight', icon: '🔑', title: 'RS256 vs HS256 — why it matters', body: 'HS256: any service with the secret can both verify AND forge tokens. One compromised service = all tokens forgeable. RS256: private key only in auth-service. All other services have only the public key (from JWKS). A compromised service can verify but not forge.' },
+          { type: 'insight', icon: '🔄', title: 'JWKS: zero-downtime key rotation', body: 'The JWKS endpoint returns multiple public keys. When rotating: publish the new key alongside the old one → wait for all active tokens (15min max) to expire → remove the old key. Services using jwks-rsa automatically fetch the new key — no redeployment needed.' },
+          { type: 'critical', icon: '🍪', title: 'Never store refresh tokens in localStorage', body: 'localStorage is readable by any JavaScript on the page — including injected XSS scripts. Store refresh tokens in HttpOnly cookies: inaccessible to JavaScript, automatically sent by the browser on matching requests. Combine with SameSite=Strict to prevent CSRF.' },
+        ],
+        files: [{ filename: 'Auth Strategy, Controller & Refresh Flow', lang: 'typescript', code: S.jwtStrategy }],
+      },
+    ],
+  },
+
+  {
+    id: 'database',
+    title: 'Database Layer: TypeORM Deep-dive',
+    subtitle: 'Connection pooling, migrations, BaseEntity, and the ledger pattern',
+    tag: { label: 'Database', color: '#d29922', bg: '#2a1f0a' },
+    description: 'TypeORM is configured with schema-per-service isolation, fail-fast connection validation, and a strict no-synchronize policy. Migrations are an immutable changelog. The BaseEntity provides UUID primary keys and optimistic locking on every entity for free.',
+    sections: [
+      {
+        title: 'Database Module & Connection Pooling',
+        description: 'The TypeORM module is @Global() — every feature module imports it without re-configuring. Connection pool sizing, statement timeouts, and schema isolation are set once here and apply to the entire service.',
+        callouts: [
+          { type: 'critical', icon: '🚫', title: 'synchronize: false is non-negotiable', body: 'TypeORM\'s synchronize: true drops columns to match entities. Rename a column in development, deploy to production, and the old column (with data) is silently dropped. Use migrations only. Run them automatically at startup with migrationsRun: true and idempotent IF EXISTS / IF NOT EXISTS guards.' },
+          { type: 'insight', icon: '🔌', title: 'PgBouncer for 200+ connections', body: 'PostgreSQL forks a process per connection. Beyond 200 active connections, latency degrades. PgBouncer in transaction-mode multiplexes many app connections into a smaller number of real PG connections. target: 1 PgBouncer instance per service with a pool of 20-50.' },
+          { type: 'tip', icon: '📊', title: 'statement_timeout vs maxQueryExecutionTime', body: 'statement_timeout (PostgreSQL): kills the query at the DB level, preventing runaway queries from consuming resources. maxQueryExecutionTime (TypeORM): only logs slow queries — does NOT kill them. You need both: log at 1s, kill at 30s.' },
+        ],
+        files: [{ filename: 'libs/database/src/database.module.ts', lang: 'typescript', code: S.typeormModule }],
+      },
+      {
+        title: 'BaseEntity, Optimistic Locking & Migrations',
+        description: 'Every entity inherits UUID primary key, audit timestamps, and a @VersionColumn for optimistic locking. Migrations are append-only — never edit a migration that has run in production.',
+        callouts: [
+          { type: 'pattern', icon: '🔒', title: 'Optimistic vs pessimistic locking', body: 'Optimistic (VersionColumn): read, modify, save — fail if someone else saved first. Best for: bet status updates, settlement (rare conflicts). Pessimistic (SELECT FOR UPDATE): hold a row lock. Best for: wallet debit (always contended). Use both: Redlock for distributed wallets, VersionColumn for bet state machine.' },
+          { type: 'insight', icon: '🔑', title: 'UUID vs BIGSERIAL primary keys', body: 'BIGSERIAL exposes your row count to any user who can create a record (e.g. betId=12345 → you have ~12k bets). UUID v4 reveals nothing. Also, UUIDs are safe to generate client-side or in microservices without coordination. Performance: use BRIN index on createdAt instead of relying on primary key ordering.' },
+          { type: 'tip', icon: '🐘', title: 'CREATE INDEX CONCURRENTLY', body: 'Regular CREATE INDEX takes an ACCESS EXCLUSIVE lock — all reads and writes on the table block until it completes. On a large table in production, this is an outage. CONCURRENTLY builds the index without blocking, takes longer, but the table stays fully accessible. Always use CONCURRENTLY in migration up() methods.' },
+        ],
+        files: [{ filename: 'Base Entity & Migration Example', lang: 'typescript', code: S.baseEntity }],
+      },
+    ],
+  },
+
+  {
+    id: 'wallet',
+    title: 'Wallet Service: Financial Ledger',
+    subtitle: 'Immutable ledger, balance components, and responsible gambling enforcement',
+    tag: { label: 'Wallet', color: '#3fb950', bg: '#0f2d18' },
+    description: 'The wallet-service is the most consistency-critical service in the platform. Every balance change is an immutable ledger entry. The wallet entity tracks four balance components — real, bonus, in-play escrow, and pending withdrawal — with PostgreSQL CHECK constraints enforcing non-negative values.',
+    sections: [
+      {
+        title: 'Wallet Entity & Transaction Ledger',
+        description: 'The Wallet entity stores running balance totals. WalletTransaction is an immutable append-only ledger — it is never updated or deleted, only inserted. The idempotency key prevents double-credits on network retries.',
+        callouts: [
+          { type: 'critical', icon: '💰', title: 'Never update ledger rows', body: 'WalletTransaction rows are immutable. If an error occurs, insert a correcting/reversing transaction — never UPDATE the original. An immutable ledger means any balance at any point in time can be reconstructed by replaying transactions. This is an audit and reconciliation requirement.' },
+          { type: 'insight', icon: '🔢', title: 'Four balance components', body: 'Real = deposited cash. Bonus = promotional funds (wagering requirements apply). In-play = escrowed for open bets (cannot withdraw). Pending withdrawal = requested but not yet PSP-processed. The withdrawable balance = real - inPlay - pendingWithdrawal. Each tracked separately for regulatory reporting.' },
+          { type: 'pattern', icon: '🛡️', title: 'DB CHECK constraints as last resort', body: 'The application code should never allow a negative balance — that\'s the Redlock + SERIALIZABLE transaction\'s job. But CHECK constraints are the ultimate safety net: they enforce invariants even if code has a bug, a migration runs directly on the DB, or someone uses psql manually.' },
+        ],
+        files: [{ filename: 'Wallet Entity & Ledger', lang: 'typescript', code: S.walletEntity }],
+      },
+      {
+        title: 'Responsible Gambling: Limit Enforcement',
+        description: 'RG is a legal requirement — not a feature. Limit checks run on every bet placement. Limits are cached in Redis for O(1) lookups. Self-exclusion is permanent by default and triggers immediate cancellation of all open bets.',
+        callouts: [
+          { type: 'critical', icon: '⚖️', title: 'Cooling-off is not optional', body: 'UKGC requires that limit reductions take effect immediately, while limit increases must wait 24+ hours (preventing impulsive reversal). Self-exclusion minimum is 6 months and cannot be reversed by the user. Failing to implement this correctly = license suspension.' },
+          { type: 'warning', icon: '⚠️', title: 'Limits in Redis, not in JWT', body: 'RG limits change frequently (user updates daily limit mid-session). Never cache them in the JWT (15min stale window too long for regulatory compliance). Store in Redis with a 30s TTL — fresh enough for real-time enforcement, fast enough for the bet-placement hot path.' },
+        ],
+        files: [{ filename: 'apps/risk-service/src/modules/risk/rg-limit.service.ts', lang: 'typescript', code: S.rgService }],
+      },
+    ],
+  },
+
+  {
+    id: 'observability',
+    title: 'Observability: OTel + Pino',
+    subtitle: 'Distributed tracing, structured logging, and PII redaction',
+    tag: { label: 'Observability', color: '#79c0ff', bg: '#121d2f' },
+    description: 'In a 6-service fleet, a single user action touches multiple services. Without distributed tracing, debugging a slow bet placement means grepping logs across 6 log streams and correlating timestamps manually. OpenTelemetry and structured JSON logging make this a 10-second query.',
+    sections: [
+      {
+        title: 'OpenTelemetry SDK & TracingInterceptor',
+        description: 'The OTel SDK auto-instruments PostgreSQL, Redis, Kafka, HTTP, and gRPC. The TracingInterceptor adds an application-level root span per handler with business context (userId, correlationId). Every child span (DB query, Redis command, downstream gRPC call) is automatically nested beneath it.',
+        callouts: [
+          { type: 'critical', icon: '⚡', title: 'OTel import order is critical', body: 'Import tracing.init as the first line of main.ts — before NestJS, TypeORM, ioredis, or kafkajs. The SDK patches modules at load time via require() hooks. If any instrumented library loads first, its operations will produce no spans. This is the most common OTel setup mistake.' },
+          { type: 'insight', icon: '📡', title: 'Tail-based sampling for cost control', body: 'At 10M users × 5 requests each = 50M traces/day. At $0.10/100k traces, that\'s $50/day without sampling. Use 100% sampling for errors (always valuable), 10% for success (statistically representative). An OTel Collector with tail-based sampling makes this decision after seeing the full trace.' },
+          { type: 'pattern', icon: '🔗', title: 'W3C TraceContext propagation', body: 'The OTel SDK propagates trace context via the W3C traceparent header. The API Gateway starts a trace; the header flows through HTTP → gRPC metadata → Kafka message headers. Every service in the chain attaches its spans to the same root trace — the full distributed call tree in one query.' },
+        ],
+        files: [{ filename: 'OTel Init & Tracing Interceptor', lang: 'typescript', code: S.otelTracing }],
+      },
+      {
+        title: 'Pino Structured Logging & PII Redaction',
+        description: 'Every log line is a JSON object queryable in Datadog/Grafana/CloudWatch without a parser. PII redaction is configured once at the logger level — no risk of a developer accidentally logging an email or card number in a new handler.',
+        callouts: [
+          { type: 'critical', icon: '🔒', title: 'Never log PII — even in dev', body: 'Developers copying a log line to Slack, a ticket, or a pastebin is a real GDPR incident. Configure redaction in the logger itself (not per-handler). Redact: Authorization header, cookies, passwords, card numbers, IBANs. Log userId (opaque UUID), never email or name.' },
+          { type: 'tip', icon: '🌊', title: 'Log level discipline', body: 'error: system broken, needs immediate attention. warn: something unexpected but handled. info: normal business events (bet placed, settlement started). debug: useful in dev only. trace: verbose internals. In production: info+. Never log at trace in prod — the volume alone can consume significant I/O budget.' },
+        ],
+        files: [{ filename: 'Pino LoggerModule Config', lang: 'typescript', code: S.pinoConfig }],
+      },
+    ],
+  },
+
+  {
+    id: 'queues',
+    title: 'BullMQ: Background Queues',
+    subtitle: 'Priority queues, processors, retry policies, and dead-letter handling',
+    tag: { label: 'Queues', color: '#f0883e', bg: '#271b0e' },
+    description: 'Notifications are delivered asynchronously via BullMQ priority queues backed by Redis. Critical notifications (2FA codes, security alerts) occupy their own queue with higher priority and more retries than marketing emails. If a worker pod crashes mid-processing, BullMQ auto-requeues the job.',
+    sections: [
+      {
+        title: 'Queue Configuration & Processor',
+        description: 'Three queues, one processor class per queue. @Processor(queueName) registers the class with BullMQ. WorkerHost.process() is called for each dequeued job. Promise.allSettled ensures partial delivery failure on one channel does not block others.',
+        callouts: [
+          { type: 'critical', icon: '💾', title: 'Queues need a dedicated Redis instance', body: 'Never use the same Redis for queues and cache. Cache uses allkeys-lru eviction policy — it silently evicts the oldest keys when memory is full. A queued notification job IS a Redis key. In a memory spike, Redis would evict queued jobs, silently dropping notifications. Use db: 1 or a dedicated Redis instance.' },
+          { type: 'insight', icon: '🔄', title: 'Stalled job detection', body: 'If a worker crashes mid-job (OOM, SIGKILL), BullMQ marks it stalled and re-queues it after a timeout. This means process() can be called twice for the same job — it MUST be idempotent. Check a "delivered" flag in Redis before sending, or use idempotent PSP/email APIs.' },
+          { type: 'pattern', icon: '📬', title: 'Promise.allSettled over Promise.all for fan-out', body: 'When delivering to email + SMS + push simultaneously, Promise.all fails fast if any channel throws. Promise.allSettled collects all results regardless — a failed email delivery does not block push. Log partial failures but do not retry the whole job (email was already sent).' },
+        ],
+        files: [{ filename: 'BullMQ Config & Processor', lang: 'typescript', code: S.bullmqQueues }],
+      },
+    ],
+  },
+
+  {
+    id: 'pipes-lifecycle',
+    title: 'Pipes, Lifecycle & Health Checks',
+    subtitle: 'Validation pipeline, module hooks, and Kubernetes probes',
+    tag: { label: 'Pipes & Lifecycle', color: '#3fb950', bg: '#0f2d18' },
+    description: 'Pipes are the validation and transformation stage — they run between the incoming request and the handler. Lifecycle hooks let services manage resource connections cleanly across deployments. Health checks tell Kubernetes whether a pod should receive traffic.',
+    sections: [
+      {
+        title: 'ValidationPipe Deep-dive & Custom Pipes',
+        description: 'ValidationPipe with whitelist + forbidNonWhitelisted + transform is the correct configuration for a financial API. The custom ParseCursorPipe shows how to implement a type-safe pagination cursor decoder as a reusable pipe.',
+        callouts: [
+          { type: 'insight', icon: '🔍', title: 'whitelist + forbidNonWhitelisted together', body: 'whitelist alone silently drops unexpected fields. forbidNonWhitelisted throws 400 if any unexpected field arrives. For a financial API, use both: unknown fields are an error, not a silent no-op. They may indicate a client sending wrong version DTOs or an attacker probing fields.' },
+          { type: 'pattern', icon: '✅', title: '@ValidateNested requires @Type', body: 'class-validator\'s @ValidateNested({ each: true }) only recurses if class-transformer knows the target type. Without @Type(() => BetSelectionDto), each element stays as a plain object and validation silently passes — even if required fields are missing. Always pair them.' },
+          { type: 'tip', icon: '🔢', title: 'implicit vs explicit type coercion', body: 'transformOptions: { enableImplicitConversion: true } coerces "?limit=20" to number without needing @Type(() => Number) everywhere. Useful for simple query strings. Disable for body DTOs — implicit coercion can silently convert things you don\'t expect.' },
+        ],
+        files: [{ filename: 'Pipes & ValidationPipe Config', lang: 'typescript', code: S.pipes }],
+      },
+      {
+        title: 'Module Lifecycle Hooks & Health Checks',
+        description: 'onModuleInit() and onModuleDestroy() bracket the service lifetime. The health controller uses @nestjs/terminus to expose readiness and liveness probes that Kubernetes uses to route traffic and restart unhealthy pods.',
+        callouts: [
+          { type: 'critical', icon: '🔌', title: 'enableShutdownHooks() is required', body: 'Without app.enableShutdownHooks() in main.ts, SIGTERM never triggers onModuleDestroy(). The pod is killed mid-Kafka-produce and messages are lost. This is especially critical for: Kafka producers (flush pending), DB connections (drain transactions), gRPC server (drain active streams).' },
+          { type: 'insight', icon: '🏥', title: 'Liveness vs readiness', body: 'Liveness: is the Node.js event loop still running? A 503 here means the pod is stuck (deadlock, OOM) — restart it. Readiness: can the pod serve requests right now? A 503 here means the DB is temporarily unreachable — remove from load balancer, but do not restart. They are different signals, not the same check.' },
+          { type: 'pattern', icon: '⏱️', title: 'terminationGracePeriodSeconds', body: 'In Kubernetes, set terminationGracePeriodSeconds = Kafka flush timeout + DB drain timeout + 10s margin. Default is 30s. If your Kafka producer can buffer for up to 5s and DB transactions drain in 10s, set terminationGracePeriodSeconds to 25+. If k8s kills the pod before onModuleDestroy() finishes, you lose data.' },
+        ],
+        files: [{ filename: 'Lifecycle Hooks & Health Controller', lang: 'typescript', code: S.lifecycleHooks }],
       },
     ],
   },
