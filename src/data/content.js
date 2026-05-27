@@ -2412,6 +2412,743 @@ export class HealthController {
   }
 }`
 
+// ─── Additional snippets (batch 2) ───────────────────────────────────────────
+
+S.executionContext = `// ExecutionContext — the single object passed to every guard and interceptor.
+// It wraps the current request regardless of transport (HTTP, gRPC, WebSocket).
+// The most important skill for writing reusable NestJS infrastructure code.
+
+// ── getType() — which transport delivered this request? ──────────────────────
+canActivate(ctx: ExecutionContext): boolean {
+  const type = ctx.getType<'http' | 'rpc' | 'ws' | 'graphql'>();
+  // 'http'    → Express/Fastify: @Get, @Post …
+  // 'rpc'     → gRPC (@GrpcMethod) or Kafka (@MessagePattern, @EventPattern)
+  // 'ws'      → Socket.IO gateway (@SubscribeMessage)
+  // 'graphql' → Apollo GraphQL resolver
+}
+
+// ── switchToHttp() — access the Express Request/Response ────────────────────
+const httpCtx = ctx.switchToHttp();
+const req  = httpCtx.getRequest<Request>();
+const res  = httpCtx.getResponse<Response>();
+
+// ── switchToRpc() — access gRPC or Kafka message context ────────────────────
+const rpcCtx = ctx.switchToRpc();
+const data     = rpcCtx.getData();      // deserialized payload
+const metadata = rpcCtx.getContext();   // gRPC Metadata or KafkaContext
+
+// ── switchToWs() — access Socket.IO client and payload ──────────────────────
+const wsCtx = ctx.switchToWs();
+const socket = wsCtx.getClient<Socket>();
+const data   = wsCtx.getData();
+
+// ── Writing a transport-agnostic guard ────────────────────────────────────────
+// One guard class — works on HTTP endpoints, gRPC methods, AND WebSocket handlers.
+// No duplicate JwtAuthGuard per transport.
+
+@Injectable()
+export class UniversalAuthGuard implements CanActivate {
+  async canActivate(ctx: ExecutionContext): Promise<boolean> {
+    const token = this.extractToken(ctx);
+    if (!token) throw new UnauthorizedException({ code: 'TOKEN_MISSING' });
+
+    const user = await this.jwtService.verifyAsync<JwtPayload>(token);
+    this.attachUser(ctx, user);
+    return true;
+  }
+
+  private extractToken(ctx: ExecutionContext): string | null {
+    switch (ctx.getType()) {
+      case 'http': {
+        const req = ctx.switchToHttp().getRequest();
+        return req.headers.authorization?.replace('Bearer ', '') ?? null;
+      }
+      case 'rpc': {
+        // gRPC: token passed in Metadata by the API gateway
+        const meta = ctx.switchToRpc().getContext<Metadata>();
+        return meta.get('authorization')[0]?.toString()?.replace('Bearer ', '') ?? null;
+      }
+      case 'ws': {
+        // WebSocket: token in socket.handshake.auth (sent at connection time)
+        const socket = ctx.switchToWs().getClient<Socket>();
+        return socket.handshake.auth?.token?.replace('Bearer ', '') ?? null;
+      }
+      default: return null;
+    }
+  }
+
+  private attachUser(ctx: ExecutionContext, user: JwtPayload): void {
+    switch (ctx.getType()) {
+      case 'http':  ctx.switchToHttp().getRequest().user = user;                       break;
+      case 'rpc':   ctx.switchToRpc().getContext<Metadata>().set('user', JSON.stringify(user)); break;
+      case 'ws':    ctx.switchToWs().getClient<Socket>().data.user = user;             break;
+    }
+  }
+}
+
+// ── getHandler() and getClass() — reading metadata in guards/interceptors ────
+// getHandler() → the CONTROLLER METHOD being called right now.
+// getClass()   → the CONTROLLER CLASS containing that method.
+// getAllAndOverride: method-level metadata wins; falls back to class-level.
+
+const roles = this.reflector.getAllAndOverride<UserRole[]>(ROLES_KEY, [
+  ctx.getHandler(),  // @Roles() placed on the handler method
+  ctx.getClass(),    // @Roles() placed on the controller class
+]);
+// If both are set, the method-level value takes precedence.`
+
+S.dynamicModules = `// Dynamic Modules — the pattern behind every forRoot() / forRootAsync() / forFeature().
+// A dynamic module is just a module factory method that returns a DynamicModule object.
+// It lets the caller pass configuration INTO the module at import time.
+//
+// Use static .forRoot() for: eager sync config (options object known at compile time).
+// Use static .forRootAsync() for: async config that needs ConfigService or other providers.
+// Use static .forFeature() for: scoped, non-global registrations (TypeORM entities, queues).
+
+@Module({})  // empty — all providers are added dynamically inside the factory methods
+export class RedisModule {
+
+  // forRoot: synchronous; caller passes a plain options object
+  static forRoot(options: RedisOptions): DynamicModule {
+    return {
+      module:   RedisModule,
+      global:   true,   // same as @Global() but set programmatically
+      providers: [
+        { provide: REDIS_OPTIONS, useValue: options },
+        RedisService,
+      ],
+      exports:  [RedisService],
+    };
+  }
+
+  // forRootAsync: most common pattern; inject ConfigService into the factory
+  static forRootAsync(opts?: {
+    imports?:    any[];
+    useFactory?: (...args: any[]) => RedisOptions | Promise<RedisOptions>;
+    inject?:     any[];
+  }): DynamicModule {
+    return {
+      module:  RedisModule,
+      global:  true,
+      imports: opts?.imports ?? [],  // caller imports ConfigModule here
+      providers: [
+        {
+          provide:    REDIS_OPTIONS,
+          useFactory: opts?.useFactory ?? (() => ({})),
+          inject:     opts?.inject     ?? [],
+        },
+        {
+          provide: REDIS_CLIENT,
+          useFactory: async (options: RedisOptions): Promise<IORedis> => {
+            const client = new IORedis(options);
+            // Wait for connection BEFORE NestJS marks the module as ready.
+            // Without this, the first Redis call races against the connection setup.
+            await new Promise<void>((res, rej) => {
+              client.once('ready', res);
+              client.once('error', rej);
+            });
+            return client;
+          },
+          inject: [REDIS_OPTIONS],
+        },
+        RedisService,
+      ],
+      exports: [RedisService, REDIS_CLIENT],
+    };
+  }
+
+  // forFeature: non-global, scoped to the importing module only
+  // e.g. RedisModule.forFeature(['user-events', 'bet-events']) registers two queues
+  static forFeature(queues: string[]): DynamicModule {
+    const providers = queues.map(name => ({
+      provide:    \`QUEUE_\${name.toUpperCase().replace(/-/g, '_')}\`,
+      useFactory: (client: IORedis) => new Queue(name, { connection: client }),
+      inject:     [REDIS_CLIENT],
+    }));
+    return {
+      module:    RedisModule,
+      providers,
+      exports:   providers.map(p => p.provide),
+    };
+  }
+}
+
+// ── Consuming a dynamic module ────────────────────────────────────────────────
+@Module({
+  imports: [
+    RedisModule.forRootAsync({
+      imports:    [ConfigModule],
+      useFactory: (config: ConfigService) => ({
+        host:     config.getOrThrow('REDIS_HOST'),
+        port:     config.get<number>('REDIS_PORT', 6379),
+        password: config.get('REDIS_PASSWORD'),
+        tls:      config.get('NODE_ENV') === 'production' ? {} : undefined,
+      }),
+      inject: [ConfigService],
+    }),
+    RedisModule.forFeature(['notification:critical', 'notification:transactional']),
+  ],
+})
+export class AppModule {}`
+
+S.serialization = `// ClassSerializerInterceptor — transforms response objects using class-transformer.
+// Applied globally: { provide: APP_INTERCEPTOR, useClass: ClassSerializerInterceptor }
+// Lets you define WHAT fields are in the API response at the class level, not in each handler.
+
+// ── @Exclude — strip a field from every response ─────────────────────────────
+export class UserResponseDto {
+  @Expose() id: string;
+  @Expose() email: string;
+  @Expose() roles: UserRole[];
+  @Expose() kycStatus: KycStatus;
+  @Expose() createdAt: Date;
+
+  @Exclude()  // never serialised to the response
+  passwordHash: string;
+
+  @Exclude()
+  twoFactorSecret: string;
+
+  // Only included when caller serialises with { groups: ['admin'] }
+  @Expose({ groups: ['admin'] })
+  internalRiskScore: number;
+}
+
+// ── @Transform — reshape a value before it leaves the service ────────────────
+export class BetResponseDto {
+  @Expose() id: string;
+  @Expose() betReference: string;
+  @Expose() status: BetStatus;
+  @Expose() type: BetType;
+
+  // Internal representation: BIGINT integer minor units (10050)
+  // External representation: formatted decimal string ("100.50")
+  // The client never sees pence — it sees currency amounts.
+  @Expose()
+  @Transform(({ value }) => (value / 100).toFixed(2))
+  stakeAmount: number;        // 10050 → "100.50"
+
+  @Expose()
+  @Transform(({ value }) => (value / 100).toFixed(2))
+  potentialPayout: number;
+
+  @Expose()
+  @Transform(({ value }) => value?.toISOString() ?? null)
+  createdAt: Date;
+
+  @Exclude() rgSnapshot: unknown;  // never expose internal RG data to players
+  @Exclude() version: number;      // ORM internals: irrelevant to API consumers
+}
+
+// ── @Type — nested object transformation ─────────────────────────────────────
+// Without @Type, class-transformer does not know what class to instantiate for nested objects.
+// @Expose/@Exclude on the nested class will be silently ignored.
+export class PlaceBetResponseDto {
+  @Expose() betId: string;
+  @Expose() betReference: string;
+
+  @Expose()
+  @Type(() => SelectionResponseDto)     // tell class-transformer the nested type
+  selections: SelectionResponseDto[];
+}
+
+// ── Controller: return DTO, interceptor handles the rest ─────────────────────
+@Get(':id')
+async getBet(@Param('id', ParseUUIDPipe) id: string): Promise<BetResponseDto> {
+  const bet = await this.queryBus.execute(new GetBetQuery(id));
+  // ClassSerializerInterceptor reads @Exclude/@Expose from BetResponseDto and applies them.
+  // Alternatively: return plainToInstance(BetResponseDto, bet) for explicit control.
+  return plainToInstance(BetResponseDto, bet, { excludeExtraneousValues: true });
+}
+
+// ── @SerializeOptions — per-route override ───────────────────────────────────
+// excludeExtraneousValues: true → ONLY @Expose() fields are included (strict whitelist)
+// groups → enables @Expose({ groups: ['admin'] }) fields for this route only
+@Get('admin/:id')
+@SerializeOptions({ groups: ['admin'], excludeExtraneousValues: true })
+async adminGetUser(@Param('id', ParseUUIDPipe) id: string) {
+  return this.usersService.findById(id);
+}`
+
+S.configModule = `// @nestjs/config deep-dive
+// ConfigModule.forRoot() + validate option = fail-fast env validation at startup.
+// Crash with a clear message if JWT_SECRET is missing — not a cryptic error on first request.
+
+// ── Step 1: define and validate env shape with class-validator ───────────────
+export class EnvironmentVariables {
+  @IsEnum(['development', 'production', 'test'])
+  NODE_ENV: string;
+
+  @IsNumber() @Min(1) @Max(65535) @Type(() => Number)
+  PORT: number = 3000;
+
+  @IsString() @IsNotEmpty()
+  DB_HOST: string;
+
+  @IsNumber() @Type(() => Number)
+  DB_PORT: number = 5432;
+
+  @IsString() @MinLength(32)       // enforce minimum entropy
+  JWT_SECRET: string;
+
+  @IsUrl()
+  JWKS_URI: string;
+
+  @IsString() @IsNotEmpty()
+  REDIS_HOST: string;
+
+  @IsString() @IsNotEmpty()
+  KAFKA_BROKERS: string;
+}
+
+export function validate(config: Record<string, unknown>) {
+  const validated = plainToInstance(EnvironmentVariables, config, { enableImplicitConversion: true });
+  const errors = validateSync(validated, { skipMissingProperties: false });
+  if (errors.length > 0) {
+    // Crash at startup: "DB_HOST is missing" > cryptic runtime failure minutes later
+    throw new Error('Config validation failed:\\n' + errors.map(e => e.toString()).join('\\n'));
+  }
+  return validated;
+}
+
+// ── Step 2: namespaced configuration ─────────────────────────────────────────
+// registerAs() creates a typed namespace. Use config.get<DbConfig>('db') instead of
+// config.get<string>('DB_HOST') — refactor-safe, auto-complete, grouped by concern.
+
+export const databaseConfig = registerAs('db', () => ({
+  host:     process.env.DB_HOST,
+  port:     parseInt(process.env.DB_PORT ?? '5432', 10),
+  username: process.env.DB_USERNAME,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  poolMax:  parseInt(process.env.DB_POOL_MAX ?? '10', 10),
+  schema:   process.env.DB_SCHEMA ?? 'public',
+}));
+export type DbConfig = ReturnType<typeof databaseConfig>;
+
+export const jwtConfig = registerAs('jwt', () => ({
+  secret:           process.env.JWT_SECRET,
+  expiresIn:        process.env.JWT_EXPIRES_IN        ?? '15m',
+  refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN ?? '30d',
+  jwksUri:          process.env.JWKS_URI,
+  audience:         process.env.JWT_AUDIENCE ?? 'betting-platform-api',
+  issuer:           process.env.JWT_ISSUER   ?? 'betting-platform-auth',
+}));
+
+// ── Step 3: module setup ──────────────────────────────────────────────────────
+ConfigModule.forRoot({
+  isGlobal:        true,          // import once in AppModule → available everywhere
+  validate,                       // crash on invalid env (fail-fast)
+  load:            [databaseConfig, jwtConfig],  // register namespaces
+  envFilePath:     ['.env.local', '.env'],        // local overrides win
+  expandVariables: true,           // support \${OTHER_VAR} references in .env
+})
+
+// ── Step 4: two injection patterns ───────────────────────────────────────────
+@Injectable()
+export class JwtService {
+  constructor(
+    // Pattern A: ConfigService (flat key lookup, untyped string)
+    private readonly config: ConfigService,
+
+    // Pattern B: typed namespace injection (preferred for complex config)
+    @Inject(jwtConfig.KEY)
+    private readonly jwtCfg: ConfigType<typeof jwtConfig>,
+  ) {
+    // Pattern A — untyped, prone to typos:
+    const secret = this.config.getOrThrow<string>('JWT_SECRET');
+
+    // Pattern B — typed, refactor-safe, auto-complete:
+    const audience = this.jwtCfg.audience;
+    const issuer   = this.jwtCfg.issuer;
+  }
+}`
+
+S.testing = `// NestJS Testing — Test.createTestingModule builds a real DI container in isolation.
+// overrideProvider() swaps any provider with a mock without changing production code.
+
+// ── Unit test: service in isolation ──────────────────────────────────────────
+describe('PlaceBetHandler', () => {
+  let handler:      PlaceBetHandler;
+  let oddsService:  jest.Mocked<OddsService>;
+  let lockService:  jest.Mocked<DistributedLockService>;
+  let dataSource:   jest.Mocked<DataSource>;
+
+  beforeEach(async () => {
+    const module = await Test.createTestingModule({
+      providers: [
+        PlaceBetHandler,
+        { provide: OddsService,            useValue: { validateSelectionOdds: jest.fn() } },
+        { provide: DistributedLockService, useValue: { withLock: jest.fn() } },
+        { provide: DataSource,             useValue: { createQueryRunner: jest.fn() } },
+        { provide: EventBus,               useValue: { publish: jest.fn() } },
+      ],
+    }).compile();
+
+    handler     = module.get(PlaceBetHandler);
+    oddsService = module.get(OddsService);
+    lockService = module.get(DistributedLockService);
+    dataSource  = module.get(DataSource);
+  });
+
+  it('rejects with ODDS_CHANGED when odds drift beyond tolerance', async () => {
+    oddsService.validateSelectionOdds.mockResolvedValue({
+      acceptable: false,
+      changes: [{ marketId: 'mkt-1', from: 2500, to: 2300 }],
+    });
+
+    const cmd = new PlaceBetCommand('user-1', 'op-1', BetType.SINGLE,
+      [{ marketId: 'mkt-1', outcomeId: 'out-1', quotedOddsDecimalMillis: 2500 }],
+      1000, OddsAcceptance.EXACT, 'GBP', 'idem-1', 'corr-1');
+
+    await expect(handler.execute(cmd)).rejects.toMatchObject({
+      response: { code: 'ODDS_CHANGED' },
+    });
+  });
+
+  it('releases wallet reservation when DB commit fails', async () => {
+    oddsService.validateSelectionOdds.mockResolvedValue({ acceptable: true, changes: [] });
+    lockService.withLock.mockImplementation((_key, fn) => fn());
+    dataSource.createQueryRunner.mockReturnValue({
+      connect:            jest.fn(),
+      startTransaction:   jest.fn(),
+      commitTransaction:  jest.fn().mockRejectedValue(new Error('DB unavailable')),
+      rollbackTransaction: jest.fn(),
+      release:            jest.fn(),
+      manager:            { save: jest.fn() },
+    } as any);
+
+    const cmd = new PlaceBetCommand('user-1', 'op-1', BetType.SINGLE, [], 1000,
+      OddsAcceptance.ANY, 'GBP', 'idem-2', 'corr-2');
+
+    await expect(handler.execute(cmd)).rejects.toThrow('DB unavailable');
+    // Verify compensating transaction was triggered
+    // expect(walletClient.releaseReservation).toHaveBeenCalledWith({ idempotencyKey: 'idem-2' });
+  });
+});
+
+// ── Integration test: real module wiring, mocked external deps ───────────────
+describe('BettingModule (integration)', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const module = await Test.createTestingModule({
+      imports: [BettingModule, DatabaseModule],
+    })
+    // overrideProvider: swap specific providers while keeping the real DI graph
+    .overrideProvider(WalletGrpcClient)
+    .useValue({ reserveStake: jest.fn().mockResolvedValue({ success: true }) })
+    .overrideProvider(RiskGrpcClient)
+    .useValue({ evaluateBetRisk: jest.fn().mockResolvedValue({ action: 'ACCEPT' }) })
+    .compile();
+
+    app = module.createNestApplication();
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }));
+    await app.init();
+  });
+
+  afterAll(() => app.close());
+});
+
+// ── E2E test: full HTTP stack with supertest ──────────────────────────────────
+describe('POST /api/v1/bets (e2e)', () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const module = await Test.createTestingModule({ imports: [AppModule] })
+      .overrideProvider(BettingProxyService)
+      .useValue({ placeBet: jest.fn().mockResolvedValue({ betId: 'test-bet-id' }) })
+      .compile();
+
+    app = module.createNestApplication();
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true }));
+    await app.init();
+  });
+
+  afterAll(() => app.close());
+
+  it('returns 401 without Authorization header', () =>
+    request(app.getHttpServer())
+      .post('/api/v1/bets')
+      .send({ type: 'SINGLE', selections: [], stakeMinorUnits: 1000, oddsAcceptance: 'ANY' })
+      .expect(401)
+      .expect(({ body }) => expect(body.error.code).toBe('AUTH_INVALID_TOKEN'))
+  );
+
+  it('returns 400 when stakeMinorUnits is negative', () =>
+    request(app.getHttpServer())
+      .post('/api/v1/bets')
+      .set('Authorization', 'Bearer ' + validTestJwt)
+      .send({ type: 'SINGLE', selections: [validSelection], stakeMinorUnits: -100, oddsAcceptance: 'ANY' })
+      .expect(400)
+      .expect(({ body }) => {
+        expect(body.error.code).toBe('VALIDATION_ERROR');
+        expect(body.error.fields).toEqual(expect.arrayContaining([
+          expect.objectContaining({ field: 'stakeMinorUnits' }),
+        ]));
+      })
+  );
+});`
+
+S.scheduler = `// @nestjs/schedule — declarative task scheduling
+// ScheduleModule.forRoot() must be imported in AppModule.
+// Methods in any @Injectable() service can use @Cron, @Interval, @Timeout.
+
+// ── @Cron — standard cron expression or CronExpression enum ──────────────────
+// If the previous execution is still running when the next fire time arrives,
+// the new execution is SKIPPED (non-overlapping by default).
+// For multi-pod deployments: use a distributed lock inside the handler.
+
+@Injectable()
+export class ScheduledTasksService implements OnModuleDestroy {
+  private readonly dynamicJobs = new Map<string, CronJob>();
+
+  constructor(private readonly schedulerRegistry: SchedulerRegistry) {}
+
+  // Every 30 seconds — process outbox rows that weren't delivered yet
+  @Cron(CronExpression.EVERY_30_SECONDS, { name: 'outbox-processor' })
+  async processOutbox(): Promise<void> {
+    // In a multi-pod deployment: acquire a distributed lock first.
+    // Without it, every pod races to publish the same outbox rows.
+    // await this.lock.withLock('outbox:processor', () => this.outboxService.process(), { ttlMs: 25_000 });
+  }
+
+  // Daily at midnight UTC — reset RG daily stake counters for all users
+  @Cron('0 0 * * *', { timeZone: 'UTC', name: 'rg-daily-reset' })
+  async resetDailyRgCounters(): Promise<void> {
+    // SCAN + DEL rg:stake:daily:* — Redis pattern delete, no individual key knowledge needed
+    this.logger.log('Resetting RG daily stake counters');
+    // await this.redis.deletePattern('rg:stake:daily:*');
+  }
+
+  // Every 2s — recalculate cashout values for all open bets
+  // In production: event-driven (trigger on odds change), not fixed interval
+  @Interval('cashout-refresh', 2_000)
+  async refreshCashoutValues(): Promise<void> { /* ... */ }
+
+  // Run ONCE, 5s after module init — warm Redis odds cache from DB
+  @Timeout('startup-warm', 5_000)
+  async warmOddsCache(): Promise<void> {
+    // Give Kafka consumer 5s to connect before we try to read from it
+    this.logger.log('Warming market odds cache...');
+  }
+
+  // ── SchedulerRegistry: add/remove/modify jobs at runtime ─────────────────
+  // Use for: per-operator schedules, user-specific reminders, data-driven timing.
+  addOperatorDailyJob(operatorId: string, cronExpression: string): void {
+    if (this.schedulerRegistry.doesExist('cron', \`op:\${operatorId}\`)) return;
+
+    const job = new CronJob(cronExpression, async () => {
+      this.logger.log({ operatorId }, 'Running operator daily settlement');
+      // await this.settlementService.runForOperator(operatorId);
+    });
+
+    this.schedulerRegistry.addCronJob(\`op:\${operatorId}\`, job);
+    job.start();
+    this.dynamicJobs.set(operatorId, job);
+  }
+
+  removeOperatorJob(operatorId: string): void {
+    const job = this.dynamicJobs.get(operatorId);
+    if (job) {
+      job.stop();
+      this.schedulerRegistry.deleteCronJob(\`op:\${operatorId}\`);
+      this.dynamicJobs.delete(operatorId);
+    }
+  }
+
+  // Stop all dynamic jobs on graceful shutdown — prevents mid-drain execution
+  onModuleDestroy(): void {
+    this.dynamicJobs.forEach((job, id) => {
+      job.stop();
+      try { this.schedulerRegistry.deleteCronJob(id); } catch {}
+    });
+  }
+}`
+
+S.exceptionHierarchy = `// NestJS Exception Hierarchy
+// All HTTP exceptions extend HttpException(response, statusCode).
+// The response can be a string or an object { code, message, ... }.
+// @Catch() filters intercept the exact exception type you specify.
+
+// ── Built-in HTTP exceptions (most commonly used) ────────────────────────────
+new BadRequestException({ code: 'VALIDATION_ERROR', fields: [...] });         // 400
+new UnauthorizedException({ code: 'TOKEN_EXPIRED' });                         // 401
+new ForbiddenException({ code: 'INSUFFICIENT_PERMISSIONS' });                 // 403
+new NotFoundException({ code: 'BET_NOT_FOUND', betId });                     // 404
+new ConflictException({ code: 'MARKET_SUSPENDED' });                         // 409
+new GoneException({ code: 'CASHOUT_EXPIRED' });                              // 410
+new UnprocessableEntityException({ code: 'RG_LIMIT_EXCEEDED', ...limits });  // 422
+new TooManyRequestsException({ code: 'RATE_LIMIT_EXCEEDED', retryAfterMs }); // 429
+new InternalServerErrorException({ code: 'INTERNAL_ERROR' });                // 500
+new ServiceUnavailableException({ code: 'CIRCUIT_OPEN' });                   // 503
+new GatewayTimeoutException({ code: 'UPSTREAM_TIMEOUT' });                   // 504
+
+// ── Custom domain exceptions — keep domain code free of HTTP concepts ────────
+// The handler throws InsufficientFundsException — it doesn't know about HTTP 409.
+// The exception filter decides the HTTP status code.
+// This makes PlaceBetHandler testable without an HTTP context.
+
+export class InsufficientFundsException extends ConflictException {
+  constructor(
+    public readonly userId: string,
+    public readonly requiredMinorUnits: number,
+    public readonly availableMinorUnits: number,
+  ) {
+    super({ code: 'INSUFFICIENT_FUNDS', message: 'Wallet balance too low to place bet' });
+    // Never expose exact balance in the response — information for attackers.
+    // Log it server-side with full context for fraud monitoring.
+  }
+}
+
+export class OddsChangedException extends ConflictException {
+  constructor(public readonly changes: OddsChange[]) {
+    super({ code: 'ODDS_CHANGED', changedSelections: changes.length });
+  }
+}
+
+export class RgLimitExceededException extends UnprocessableEntityException {
+  constructor(public readonly limitType: string, public readonly cooldownUntil?: Date) {
+    super({ code: 'RG_LIMIT_EXCEEDED', limitType,
+      cooldownUntil: cooldownUntil?.toISOString() });
+  }
+}
+
+// ── Non-HTTP transport exceptions ─────────────────────────────────────────────
+// When a Kafka consumer or gRPC handler needs to signal an error:
+throw new RpcException({ code: 'ODDS_CHANGED', message: 'Odds have drifted' });
+// The Kafka/gRPC framework translates this into the appropriate transport error.
+
+// WebSocket handlers:
+throw new WsException({ code: 'SUBSCRIPTION_LIMIT', message: 'Max 100 subscriptions' });
+
+// ── @Catch(SpecificType) — typed exception filter ────────────────────────────
+// Catches ONLY InsufficientFundsException — other exceptions fall through.
+@Catch(InsufficientFundsException)
+export class InsufficientFundsFilter implements ExceptionFilter {
+  catch(ex: InsufficientFundsException, host: ArgumentsHost): void {
+    const res = host.switchToHttp().getResponse<Response>();
+    // Full context for fraud/risk monitoring (server-side only)
+    this.logger.warn({
+      userId:    ex.userId,
+      required:  ex.requiredMinorUnits,
+      available: ex.availableMinorUnits,
+    }, 'Bet rejected: insufficient funds');
+    // Lean response to client — never expose internal balance state
+    res.status(409).json({ error: { code: 'INSUFFICIENT_FUNDS', message: ex.message } });
+  }
+}
+
+// ── WebSocket exception filter ────────────────────────────────────────────────
+@Catch(WsException)
+export class WsExceptionFilter extends BaseWsExceptionFilter {
+  catch(exception: WsException, host: ArgumentsHost): void {
+    const client = host.switchToWs().getClient<Socket>();
+    client.emit('error', { code: exception.getError() });
+    // Do NOT disconnect on every error — only disconnect on auth failures.
+  }
+}`
+
+S.microservicePatterns = `// NestJS Microservice Patterns
+// @MessagePattern → Request-Response (caller awaits a reply)
+// @EventPattern   → Fire-and-Forget (no reply expected, at-least-once delivery)
+//
+// Transport choice:
+//   Synchronous queries:   gRPC (typed, streaming, low-latency, deadline propagation)
+//   Domain events:         Kafka (durable, replayable, auditable, 7yr retention)
+//   @MessagePattern+Kafka: useful for request-response over Kafka when gRPC isn't available
+
+// ── Receiving side: Kafka consumer ────────────────────────────────────────────
+@Controller()
+export class BettingMicroserviceController {
+
+  // @MessagePattern: MUST return a value — the framework sends it back as the reply.
+  // Only useful on Kafka if the client subscribes to the reply topic (see ClientProxy below).
+  @MessagePattern(KafkaTopics.GET_BET_BY_ID)
+  async getBet(
+    @Payload() data: { betId: string; userId: string },
+    @Ctx() context: KafkaContext,
+  ): Promise<BetDto | null> {
+    // Correlation header is in the Kafka message headers
+    const headers = context.getMessage().headers;
+    this.logger.debug({ betId: data.betId, correlationId: headers?.['x-correlation-id'] });
+    return this.queryBus.execute(new GetBetQuery(data.betId, data.userId));
+  }
+
+  // @EventPattern: no return value; fire-and-forget from the producer's perspective.
+  // At-least-once delivery: this handler MUST be idempotent.
+  @EventPattern(KafkaTopics.MARKET_ODDS_UPDATED)
+  async onOddsUpdated(
+    @Payload() data: { marketId: string; outcomes: OddsUpdate[] },
+    @Ctx() context: KafkaContext,
+  ): Promise<void> {
+    const msgId = context.getMessage().key?.toString();
+    // const alreadyProcessed = await this.redis.exists(\`dedup:odds:\${msgId}\`);
+    // if (alreadyProcessed) return; // idempotency guard
+
+    await this.oddsCache.bulkUpdate(data.marketId, data.outcomes);
+    // Manual offset commit after successful processing
+    // const { offset } = context.getMessage();
+    // await context.getConsumer().commitOffsets([{ topic, partition, offset: (BigInt(offset) + 1n).toString() }]);
+  }
+}
+
+// ── Sending side: ClientProxy ─────────────────────────────────────────────────
+// ClientProxy is transport-agnostic — same API for Kafka, Redis, TCP, NATS.
+// Injected via @Inject(SERVICE_TOKEN) where the token maps to ClientsModule registration.
+
+@Injectable()
+export class BettingProducer implements OnModuleInit {
+  constructor(
+    @Inject(KAFKA_SERVICE_TOKEN)
+    private readonly client: ClientKafka,
+  ) {}
+
+  async onModuleInit(): Promise<void> {
+    // For request-response over Kafka, subscribe to the reply topic BEFORE connecting.
+    // NestJS generates a reply topic: originalTopic + '.reply'
+    this.client.subscribeToResponseOf(KafkaTopics.GET_BET_BY_ID);
+    await this.client.connect();
+  }
+
+  // send() → returns Observable<T>; wraps request-response pattern.
+  // Always pipe timeout() — never await an Observable that might never emit.
+  async getBetById(betId: string, userId: string): Promise<BetDto> {
+    return firstValueFrom(
+      this.client.send<BetDto, { betId: string; userId: string }>(
+        KafkaTopics.GET_BET_BY_ID,
+        { betId, userId },
+      ).pipe(timeout(3_000)),  // 3s deadline — don't wait forever for a reply
+    );
+  }
+
+  // emit() → fire-and-forget. Returns Observable<void>; resolves on broker ack.
+  // With idempotent producer + acks: 'all', this is durably accepted by Kafka.
+  async publishBetPlaced(event: BetPlacedEvent): Promise<void> {
+    await firstValueFrom(
+      this.client.emit(KafkaTopics.BET_PLACED, {
+        key:     event.userId,         // partition by userId: ordering within a user's bets
+        value:   event,
+        headers: { 'x-correlation-id': event.correlationId },
+      }),
+    );
+  }
+}
+
+// ── ClientsModule registration ────────────────────────────────────────────────
+// In AppModule (or the feature module that needs to produce):
+ClientsModule.registerAsync([{
+  name: KAFKA_SERVICE_TOKEN,
+  inject: [ConfigService],
+  useFactory: (config: ConfigService) => ({
+    transport: Transport.KAFKA,
+    options: {
+      client: { brokers: config.getOrThrow<string>('KAFKA_BROKERS').split(',') },
+      producer: { idempotent: true, allowAutoTopicCreation: false },
+    },
+  }),
+}])`
+
 // ─── Chapter definitions ──────────────────────────────────────────────────────
 export const chapters = [
   {
@@ -2954,6 +3691,166 @@ export const chapters = [
           { type: 'pattern', icon: '⏱️', title: 'terminationGracePeriodSeconds', body: 'In Kubernetes, set terminationGracePeriodSeconds = Kafka flush timeout + DB drain timeout + 10s margin. Default is 30s. If your Kafka producer can buffer for up to 5s and DB transactions drain in 10s, set terminationGracePeriodSeconds to 25+. If k8s kills the pod before onModuleDestroy() finishes, you lose data.' },
         ],
         files: [{ filename: 'Lifecycle Hooks & Health Controller', lang: 'typescript', code: S.lifecycleHooks }],
+      },
+    ],
+  },
+
+  {
+    id: 'execution-context',
+    title: 'ExecutionContext Deep-dive',
+    subtitle: 'Writing guards & interceptors that work across HTTP, gRPC, and WebSocket',
+    tag: { label: 'Core concept', color: '#58a6ff', bg: '#121d2f' },
+    description: 'ExecutionContext is the most important object in NestJS infrastructure code. Every guard and interceptor receives one. It is transport-agnostic — the same object whether the request came from an HTTP client, a gRPC caller, or a WebSocket message. Understanding it lets you write one guard class that works everywhere.',
+    sections: [
+      {
+        title: 'ExecutionContext, getType(), switchTo*(), and Reflector',
+        description: 'The context exposes the current transport type, the handler method being called, and the controller class. switchToHttp/Rpc/Ws returns a transport-specific object. getHandler() + getClass() are how Reflector reads your custom decorator metadata.',
+        callouts: [
+          { type: 'insight', icon: '🔀', title: 'One guard for all transports', body: 'JwtAuthGuard can extend AuthGuard(\'jwt\') for HTTP or implement CanActivate directly for multi-transport use. The UniversalAuthGuard pattern here handles HTTP Bearer tokens, gRPC Metadata headers, and WebSocket handshake auth in the same canActivate() method — no code duplication.' },
+          { type: 'warning', icon: '⚠️', title: 'switchToHttp() throws on other transports', body: 'Calling ctx.switchToHttp() inside a guard attached to a gRPC handler throws a runtime error. Always check ctx.getType() first, or use try/catch. This is the most common cause of "guard works on HTTP but crashes on Kafka consumer" bugs.' },
+          { type: 'tip', icon: '💡', title: 'getAllAndOverride vs getAllAndMerge', body: 'getAllAndOverride: the more specific decorator wins (method > class). Use for @Roles, @Timeout — you want the method\'s value to override the class default. getAllAndMerge: combines both arrays into one. Use when accumulating multiple values, e.g. collecting required capabilities from both class and method.' },
+        ],
+        files: [{ filename: 'ExecutionContext Reference', lang: 'typescript', code: S.executionContext }],
+      },
+    ],
+  },
+
+  {
+    id: 'dynamic-modules',
+    title: 'Dynamic Modules',
+    subtitle: 'Building forRoot(), forRootAsync(), and forFeature() yourself',
+    tag: { label: 'Module system', color: '#a371f7', bg: '#1f1535' },
+    description: 'Dynamic modules are how NestJS allows library modules to be configured by the application — ConfigModule, TypeOrmModule, BullModule, and every @Global module uses this pattern. Building one teaches you exactly how the NestJS DI container wires up async providers and how forFeature() achieves scoped registrations.',
+    sections: [
+      {
+        title: 'forRoot, forRootAsync, and forFeature',
+        description: 'forRoot() is synchronous config. forRootAsync() is the async equivalent — it accepts useFactory + inject so the module can receive ConfigService. forFeature() returns a non-global DynamicModule that adds scoped providers only to the importing module.',
+        callouts: [
+          { type: 'insight', icon: '🏭', title: 'forRootAsync is a DynamicModule factory', body: 'The method returns a plain JavaScript object { module, providers, exports, imports, global }. There is no magic — NestJS reads this object exactly as it would read a @Module() decorator. Understanding this means you can debug any third-party module by logging its returned DynamicModule.' },
+          { type: 'pattern', icon: '🔗', title: 'forFeature for scoped registrations', body: 'TypeOrmModule.forFeature([Bet]) creates TypeORM repositories only for the BettingModule. BullModule.registerQueue creates queue clients only for the importing module. This prevents every module from polluting the global DI container with hundreds of entity repositories.' },
+          { type: 'warning', icon: '⚠️', title: 'Await async providers before module ready', body: 'If useFactory is async, NestJS awaits it before marking the module as initialized. If your Redis factory does NOT await the connection ready event, the first Redis call after startup races against the connecting state. Always await the connection inside the factory.' },
+        ],
+        files: [{ filename: 'Dynamic Module Implementation', lang: 'typescript', code: S.dynamicModules }],
+      },
+    ],
+  },
+
+  {
+    id: 'serialization',
+    title: 'Response Serialization',
+    subtitle: 'ClassSerializerInterceptor, @Exclude, @Expose, and @Transform',
+    tag: { label: 'Interceptor', color: '#79c0ff', bg: '#121d2f' },
+    description: 'ClassSerializerInterceptor runs class-transformer on every response object. Combined with @Exclude and @Expose decorators on your DTO classes, it provides a declarative, class-level API for controlling what data leaves the service — no manual property deletion in handlers.',
+    sections: [
+      {
+        title: '@Exclude, @Expose, @Transform, @Type, and @SerializeOptions',
+        description: 'Annotate your response DTO with which fields are visible. @Transform reshapes values — use it to convert internal integer minor units to formatted decimal strings for clients. @Type is required for nested objects to receive their own @Exclude/@Expose treatment.',
+        callouts: [
+          { type: 'critical', icon: '🔒', title: 'excludeExtraneousValues: true is the safe default', body: 'Without it, ClassSerializerInterceptor includes ALL properties unless @Exclude is applied — a new property added to the entity silently appears in the API response. With excludeExtraneousValues: true, ONLY @Expose() fields are included. This is a whitelist, not a blacklist.' },
+          { type: 'insight', icon: '🔄', title: 'Convert BIGINT minor units at the serialisation layer', body: 'Internal representation: 10050 (integer pence). External: "100.50" (formatted string). The @Transform decorator on the DTO is the single place this conversion lives — not scattered across handlers. Clients always see formatted values; the domain always works in integers.' },
+          { type: 'warning', icon: '⚠️', title: '@Type is required for nested object serialisation', body: 'Without @Type(() => SelectionResponseDto), class-transformer treats nested objects as plain Record<string, unknown>. The @Exclude/@Expose decorators on SelectionResponseDto are silently ignored. Always pair @ValidateNested + @Type for input, @Expose + @Type for output.' },
+        ],
+        files: [{ filename: 'Response Serialisation with class-transformer', lang: 'typescript', code: S.serialization }],
+      },
+    ],
+  },
+
+  {
+    id: 'config-module',
+    title: 'Configuration Module',
+    subtitle: '@nestjs/config, namespaced config, and fail-fast validation',
+    tag: { label: 'Config', color: '#d29922', bg: '#2a1f0a' },
+    description: 'The validate option in ConfigModule.forRoot() is the most important configuration decision. Crash immediately at startup if JWT_SECRET is missing — not with a cryptic error on the first authenticated request. Namespaced config with registerAs() provides typed, auto-complete access to grouped settings.',
+    sections: [
+      {
+        title: 'Env Validation, Namespaced Config, and Injection Patterns',
+        description: 'class-validator validates every environment variable at startup. registerAs() groups related config into typed namespaces. The typed @Inject(configToken.KEY) pattern is refactor-safe and provides full TypeScript auto-complete — no more string key lookups scattered across services.',
+        callouts: [
+          { type: 'critical', icon: '💥', title: 'validate fails fast at startup', body: 'Without validate, a missing JWT_SECRET surfaces as a cryptic RS256 error on the first authenticated request in production — possibly minutes after deploy. With validate, the pod refuses to start and the Kubernetes readiness probe fails immediately. Fail fast, fail loudly.' },
+          { type: 'insight', icon: '📦', title: 'registerAs creates a typed namespace', body: 'config.get<string>(\'DB_HOST\') is a string lookup that can drift from the actual env var name. databaseConfig.host is TypeScript-typed and refactor-safe — rename the env var in registerAs, the TypeScript compiler finds all usages. Use namespaced config for any service with more than 5 env vars.' },
+          { type: 'tip', icon: '🔍', title: 'expandVariables for .env composition', body: 'With expandVariables: true, you can write DB_URL=postgresql://${DB_USER}:${DB_PASSWORD}@${DB_HOST}/db in your .env file. Good for composing connection strings from individual parts while still validating each component separately with class-validator.' },
+        ],
+        files: [{ filename: '@nestjs/config Deep-dive', lang: 'typescript', code: S.configModule }],
+      },
+    ],
+  },
+
+  {
+    id: 'testing',
+    title: 'Testing in NestJS',
+    subtitle: 'createTestingModule, overrideProvider, integration & E2E tests',
+    tag: { label: 'Testing', color: '#3fb950', bg: '#0f2d18' },
+    description: 'NestJS testing builds a real DI container in isolation. overrideProvider() swaps any provider with a mock without touching production code. The same module hierarchy used in production is used in tests — you get real DI wiring validation for free alongside your functional tests.',
+    sections: [
+      {
+        title: 'Unit Tests, Integration Tests, and E2E with supertest',
+        description: 'Unit tests isolate one class with mocked dependencies. Integration tests wire real modules but mock external calls (gRPC, Kafka). E2E tests spin up the full HTTP stack with supertest — test the API contract including validation, guards, and the response envelope.',
+        callouts: [
+          { type: 'insight', icon: '🏗️', title: 'overrideProvider: mock at the boundary', body: 'Mock the providers that represent external systems (WalletGrpcClient, RiskGrpcClient, KafkaProducer). Keep the real DI wiring for everything internal (CommandBus, BetRepository, OddsService). This tests the actual orchestration logic while isolating network calls.' },
+          { type: 'pattern', icon: '🧪', title: 'Test the contract, not the implementation', body: 'E2E tests should assert: status code, error.code structure, response envelope shape — not that a specific internal method was called. This lets you refactor the implementation freely without rewriting tests. Integration tests assert observable DB state, not internal service calls.' },
+          { type: 'tip', icon: '💡', title: 'Use a real test database, not mocks', body: 'TypeORM repository mocks pass tests even when the query is wrong (WHERE clause typo, missing index). Use a real PostgreSQL test database (Docker Compose in CI). Integration tests that hit real DB catch: missing migrations, constraint violations, wrong isolation levels.' },
+        ],
+        files: [{ filename: 'Unit, Integration & E2E Tests', lang: 'typescript', code: S.testing }],
+      },
+    ],
+  },
+
+  {
+    id: 'scheduling',
+    title: 'Task Scheduling',
+    subtitle: '@Cron, @Interval, SchedulerRegistry, and dynamic jobs',
+    tag: { label: 'Scheduler', color: '#f0883e', bg: '#271b0e' },
+    description: 'The platform uses scheduled tasks for: outbox polling (every 30s), RG counter resets (nightly), expired session cleanup, and market data aggregation. @nestjs/schedule wraps node-cron and provides declarative method-level scheduling with a SchedulerRegistry for runtime job management.',
+    sections: [
+      {
+        title: '@Cron, @Interval, @Timeout, and Dynamic Job Management',
+        description: 'Decorators register jobs at module init. SchedulerRegistry lets you add, remove, and query jobs at runtime — essential when job timing comes from database configuration (per-operator settlement schedules, user-specific reminders).',
+        callouts: [
+          { type: 'warning', icon: '⚠️', title: '@Cron skips if previous execution is still running', body: 'This is the default (non-overlapping) behaviour — good for idempotent tasks. But if the outbox processor takes longer than 30s, you silently fall behind. Add a distributed lock with a TTL slightly shorter than the interval, and monitor lag via a "outbox_unpublished_count" metric.' },
+          { type: 'insight', icon: '🌍', title: 'timeZone option for multi-jurisdiction platforms', body: 'A nightly RG reset at midnight UTC is wrong for UK users (BST = UTC+1 in summer). Use { timeZone: \'Europe/London\' }. For per-operator timezones stored in the DB, use SchedulerRegistry.addCronJob() at startup with each operator\'s preferred timezone.' },
+          { type: 'critical', icon: '🔒', title: 'Use distributed locks in multi-pod deployments', body: 'Every pod runs the same @Cron handlers. Without a distributed lock, 3 pods × 1 outbox processor = 3× publishes for each outbox row. Use DistributedLockService.withLock() inside every @Cron handler that produces side effects (DB writes, Kafka publishes, external API calls).' },
+        ],
+        files: [{ filename: 'Scheduled Tasks Service', lang: 'typescript', code: S.scheduler }],
+      },
+    ],
+  },
+
+  {
+    id: 'exceptions',
+    title: 'Exception Hierarchy & Custom Exceptions',
+    subtitle: 'Built-in exceptions, domain exceptions, WsException, RpcException',
+    tag: { label: 'Exceptions', color: '#f85149', bg: '#2d1318' },
+    description: 'NestJS provides a full hierarchy of HTTP exceptions, but the real power is in custom domain exceptions. Throwing InsufficientFundsException instead of ConflictException keeps business logic free of HTTP concerns, enables typed @Catch() filters with context-rich logging, and makes test assertions readable.',
+    sections: [
+      {
+        title: 'Exception Types, Custom Domain Exceptions, and Typed Filters',
+        description: 'All 14 built-in HTTP exceptions, non-HTTP exceptions (RpcException, WsException), and how to build custom domain exceptions that carry rich context for logging while returning safe minimal responses to clients.',
+        callouts: [
+          { type: 'insight', icon: '🏛️', title: 'Domain exceptions decouple from HTTP', body: 'PlaceBetHandler throws InsufficientFundsException — it has no knowledge of HTTP 409. The exception filter decides the HTTP status. This makes the handler fully testable with jest.fn() without starting an HTTP server, and makes the intent explicit: "funds were insufficient" is clearer than "conflict".' },
+          { type: 'critical', icon: '🔒', title: 'Never expose internal state in exception responses', body: 'InsufficientFundsException logs userId + required + available server-side. The client response says only "Insufficient funds" with no amounts. An attacker who can observe the exact balance gap can probe the wallet state. Log everything; expose nothing sensitive.' },
+          { type: 'pattern', icon: '🎯', title: '@Catch(SpecificType) for domain exception routing', body: 'The global @Catch() filter handles everything. Typed filters @Catch(InsufficientFundsException) intercept before the global filter — use them when a specific exception needs richer logging, a different response shape, or side effects (alerting, fraud flagging). Both can coexist.' },
+        ],
+        files: [{ filename: 'Exception Hierarchy Reference', lang: 'typescript', code: S.exceptionHierarchy }],
+      },
+    ],
+  },
+
+  {
+    id: 'microservice-patterns',
+    title: 'Microservice Patterns',
+    subtitle: '@MessagePattern, @EventPattern, ClientProxy, send() vs emit()',
+    tag: { label: 'Microservices', color: '#79c0ff', bg: '#121d2f' },
+    description: 'NestJS microservice decorators abstract the transport — the same @MessagePattern works over Kafka, Redis, TCP, or NATS. ClientProxy.send() provides request-response; .emit() is fire-and-forget. The critical difference: only use Kafka @MessagePattern for queries that truly need a reply; prefer gRPC for low-latency synchronous calls.',
+    sections: [
+      {
+        title: '@MessagePattern vs @EventPattern, ClientProxy, and ClientsModule',
+        description: 'The receiving side uses @MessagePattern for queries that need a typed reply and @EventPattern for domain events that need no reply. The sending side uses ClientProxy — the transport-agnostic client that maps send() to request-response and emit() to fire-and-forget.',
+        callouts: [
+          { type: 'insight', icon: '📨', title: 'send() vs emit() — the key difference', body: 'ClientProxy.send() waits for a reply — use for queries (get bet, check balance). ClientProxy.emit() is fire-and-forget — use for domain events (bet placed, user registered). emit() resolves when the broker acknowledges receipt, not when a consumer has processed it. Always pipe timeout() onto send() — a missing consumer means it never resolves.' },
+          { type: 'warning', icon: '⚠️', title: 'subscribeToResponseOf() before connect()', body: 'For Kafka request-response, call subscribeToResponseOf(topic) in onModuleInit() BEFORE connect(). NestJS generates a reply topic and needs to subscribe to it before the connection is established. Missing this = send() never receives a reply, timeout after N seconds.' },
+          { type: 'pattern', icon: '🔑', title: 'Partition by userId for event ordering', body: 'When emitting BET_PLACED with key: event.userId, all bets from the same user land in the same Kafka partition. Consumers processing that partition see events in order. This makes per-user RG limit tracking and fraud detection reliable — no out-of-order bet events to reconcile.' },
+        ],
+        files: [{ filename: 'Microservice Patterns Reference', lang: 'typescript', code: S.microservicePatterns }],
       },
     ],
   },
