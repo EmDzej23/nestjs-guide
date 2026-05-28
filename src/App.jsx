@@ -1,23 +1,14 @@
 import React, { useState, useCallback } from 'react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { chapters } from './data/content'
+import { chapters, deskbirdChapters } from './data/content'
 
 /* ─── Sidebar ──────────────────────────────────────────────────────────── */
-function Sidebar({ current, onSelect }) {
+function Sidebar({ current, onSelect, chapters: chapterList }) {
   return (
     <aside className="sidebar">
-      <div className="sidebar-header">
-        <div className="sidebar-logo">
-          <span className="sidebar-logo-icon">♠</span>
-          <div>
-            <div className="sidebar-logo-title">BetPlatform</div>
-            <div className="sidebar-logo-sub">Architecture Guide</div>
-          </div>
-        </div>
-      </div>
       <nav className="sidebar-nav">
-        {chapters.map((ch, i) => (
+        {chapterList.map((ch, i) => (
           <button
             key={ch.id}
             className={`sidebar-item ${i === current ? 'active' : ''} ${i < current ? 'completed' : ''}`}
@@ -36,6 +27,8 @@ function Sidebar({ current, onSelect }) {
     </aside>
   )
 }
+
+
 
 /* ─── Callout ──────────────────────────────────────────────────────────── */
 function Callout({ type, icon, title, body }) {
@@ -282,11 +275,26 @@ function ChapterView({ chapter }) {
   return <GenericChapter chapter={chapter} />
 }
 
+/* ─── Tab Bar ──────────────────────────────────────────────────────────────── */
+const TABS = [
+  { id: 'betting', label: '♠ Betting Platform', sub: 'Architecture Guide' },
+  { id: 'deskbird', label: '🏢 deskbird', sub: 'Example App' },
+]
+
 /* ─── App ──────────────────────────────────────────────────────────────── */
 export default function App() {
+  const [activeTab, setActiveTab] = useState('betting')
   const [current, setCurrent] = useState(0)
-  const total = chapters.length
+
+  const chapterList = activeTab === 'deskbird' ? deskbirdChapters : chapters
+  const total = chapterList.length
   const progress = Math.round(((current + 1) / total) * 100)
+
+  const switchTab = useCallback((tabId) => {
+    setActiveTab(tabId)
+    setCurrent(0)
+    document.querySelector('.main-content')?.scrollTo({ top: 0, behavior: 'smooth' })
+  }, [])
 
   const goTo = useCallback((i) => {
     setCurrent(i)
@@ -296,7 +304,7 @@ export default function App() {
   const prev = useCallback(() => { if (current > 0) goTo(current - 1) }, [current, goTo])
   const next = useCallback(() => { if (current < total - 1) goTo(current + 1) }, [current, total, goTo])
 
-  const chapter = chapters[current]
+  const chapter = chapterList[current]
 
   return (
     <div className="app">
@@ -304,26 +312,32 @@ export default function App() {
       <header className="header">
         <div className="header-left">
           <span className="header-logo">♠</span>
-          <span className="header-title">Betting Platform — Architecture Guide</span>
+          <span className="header-title">NestJS Architecture Guide</span>
         </div>
         <div className="header-center">
+          <div className="tab-bar">
+            {TABS.map(t => (
+              <button
+                key={t.id}
+                className={`tab-btn ${activeTab === t.id ? 'active' : ''}`}
+                onClick={() => switchTab(t.id)}
+              >
+                <span className="tab-label">{t.label}</span>
+                <span className="tab-sub">{t.sub}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="header-right">
           <div className="progress-bar-track">
             <div className="progress-bar-fill" style={{ width: `${progress}%` }} />
           </div>
           <span className="progress-label">{current + 1} / {total}</span>
         </div>
-        <div className="header-right">
-          <span
-            className="header-tag"
-            style={{ color: chapter.tag?.color, background: chapter.tag?.bg, borderColor: chapter.tag?.color }}
-          >
-            {chapter.tag?.label}
-          </span>
-        </div>
       </header>
 
       <div className="layout">
-        <Sidebar current={current} onSelect={goTo} />
+        <Sidebar current={current} onSelect={goTo} chapters={chapterList} />
 
         <main className="main-content">
           <ChapterView chapter={chapter} />
@@ -335,12 +349,12 @@ export default function App() {
             </button>
 
             <div className="nav-dots">
-              {chapters.map((_, i) => (
+              {chapterList.map((_, i) => (
                 <button
                   key={i}
                   className={`nav-dot ${i === current ? 'active' : ''} ${i < current ? 'completed' : ''}`}
                   onClick={() => goTo(i)}
-                  title={chapters[i].title}
+                  title={chapterList[i].title}
                 />
               ))}
             </div>

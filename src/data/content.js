@@ -3152,6 +3152,451 @@ ClientsModule.registerAsync([{
 // ─── Chapter definitions ──────────────────────────────────────────────────────
 export const chapters = [
   {
+    id: 'nestjs-concepts',
+    title: 'NestJS Core Concepts',
+    subtitle: 'Module, Provider, Controller, Service, Guard — explained by a staff engineer',
+    tag: { label: 'Legend', color: '#a371f7', bg: '#1f1535' },
+    description: 'Before any architecture diagram makes sense, you need to understand the vocabulary. These are the nine building blocks NestJS is made of. Not the official docs version — the mental model you actually need to read production code and make good decisions.',
+    sections: [
+      {
+        title: 'The DI Container — the engine everything runs on',
+        description: 'NestJS is not an HTTP framework with dependency injection bolted on — it is an IoC container that manages object creation and wiring, with HTTP, gRPC, and WebSocket support sitting on top of it.',
+        callouts: [
+          {
+            type: 'insight', icon: '⚙️', title: 'NestJS is fundamentally a dependency injection framework with HTTP on top',
+            body: 'Everything else — modules, providers, guards, interceptors — is a structured way to tell the DI container what to create, in what order, and who gets access to what. When you understand that NestJS is an IoC container first and an HTTP framework second, every decorator and pattern makes immediate sense.',
+          },
+          {
+            type: 'pattern', icon: '🔄', title: 'The container lifecycle: create → wire → use → destroy',
+            body: 'On startup, NestJS reads the module tree, figures out the dependency graph, instantiates every provider in the correct order (leaf dependencies first), and wires them into whoever needs them. After that, the same singleton instances serve every request for the lifetime of the app. On shutdown (SIGTERM), onModuleDestroy() hooks run in reverse order — close DB pools, flush Kafka producers, drain queues.',
+          },
+        ],
+      },
+      {
+        title: 'Module',
+        description: 'A module is the unit of encapsulation in NestJS — it declares what it owns, what it exposes, and what it depends on, making it impossible for providers to leak across domain boundaries by accident.',
+        callouts: [
+          {
+            type: 'pattern', icon: '📦', title: 'Module = encapsulation boundary, not a file boundary',
+            body: 'A module is not just a barrel file. It is a contract: "these providers exist, these are public, these are private." BettingModule can expose BettingService but keep PlaceBetHandler, BetRepository, and OddsValidator private. Nothing outside BettingModule can inject those. This forces you to think about the public API of each domain slice — the same discipline as designing a library.',
+          },
+          {
+            type: 'insight', icon: '🌍', title: '@Global() — use sparingly, for true infrastructure',
+            body: '@Global() makes all of a module\'s exports available everywhere without importing it. Correct uses: RedisModule, LoggerModule, ConfigModule, TracingModule — things every module legitimately needs. Wrong uses: anything domain-specific. @Global() on a domain module destroys the dependency graph — you can no longer tell from a module\'s imports list what it actually depends on.',
+          },
+          {
+            type: 'tip', icon: '🔧', title: 'Dynamic modules — forRoot / forRootAsync / forFeature',
+            body: 'A static @Module() has the same providers every time. A dynamic module (forRoot returns a DynamicModule object) lets the caller pass configuration that changes what providers are created. forRoot() = sync config. forRootAsync() = config comes from another provider (ConfigService). forFeature() = register a subset (e.g. TypeOrmModule.forFeature([UserEntity]) registers only the User repository for that module).',
+          },
+        ],
+        files: [{
+          filename: 'module anatomy',
+          lang: 'typescript',
+          code: `@Module({
+  imports: [
+    // Other modules whose EXPORTED providers this module can inject.
+    // Importing a module does NOT give you its private providers — only its exports.
+    TypeOrmModule.forFeature([Bet, BetLeg]),
+    KafkaModule,           // @Global(), so not strictly needed — but makes the dep explicit
+  ],
+  controllers: [
+    // HTTP/gRPC/WebSocket entry points. Controllers are never injected into other things —
+    // they are leaves in the dependency graph.
+    BettingController,
+    BettingGrpcController,
+  ],
+  providers: [
+    // Everything the DI container should create and manage for this module.
+    // Private by default — not accessible outside this module.
+    PlaceBetHandler,
+    CashoutHandler,
+    BetRepository,
+    OddsValidator,
+  ],
+  exports: [
+    // Subset of providers made available to modules that import this one.
+    // Exporting a provider does not make it @Global() — the importer still has
+    // to explicitly import BettingModule to get access.
+    BetRepository,
+  ],
+})
+export class BettingModule {}`,
+        }],
+      },
+      {
+        title: 'Provider',
+        description: 'A provider is anything the DI container creates and manages — the token is its name, the scope controls its lifetime, and the injection mechanism is how it ends up in whatever needs it.',
+        callouts: [
+          {
+            type: 'pattern', icon: '💉', title: 'Four ways to provide a value',
+            body: 'useClass: NestJS instantiates the class and injects its constructor dependencies. useFactory: a function (can be async) that returns the value — factory dependencies are listed in inject[]. useValue: a plain object or primitive, no class needed — useful for config objects and tokens. useExisting: alias one token to another already-registered provider.',
+          },
+          {
+            type: 'insight', icon: '🔑', title: 'Injection tokens — strings, Symbols, or class references',
+            body: 'When you write constructor(private userService: UserService), NestJS uses the TypeScript type UserService as the injection token. For non-class values (config objects, primitives, interfaces) you need an explicit token: @Inject("REDIS_CLIENT") or @Inject(REDIS_TOKEN). Symbols are better than strings for tokens — they are unique by identity and cannot clash across libraries.',
+          },
+          {
+            type: 'warning', icon: '⚠️', title: 'Scope.REQUEST creates a new instance per request — and it bubbles',
+            body: 'Default scope is Singleton — one instance for the entire app lifetime. Scope.REQUEST creates a fresh instance per request, injecting a reference to the current request object. The catch: if a singleton depends on a request-scoped provider, NestJS must make that singleton request-scoped too — the scope bubbles up the entire dependency chain. This can unintentionally make critical services like DB connections request-scoped. Only use Scope.REQUEST when you genuinely need per-request isolation.',
+          },
+        ],
+        files: [{
+          filename: 'provider registration patterns',
+          lang: 'typescript',
+          code: `// The four provider forms — all valid in the providers array
+
+// 1. useClass (shorthand: just the class name)
+providers: [UserService]
+// expands to: { provide: UserService, useClass: UserService }
+
+// 2. useFactory — for async setup, external resources, conditional logic
+{
+  provide: 'REDIS_CLIENT',
+  useFactory: async (config: ConfigService) => {
+    const client = new Redis(config.get('REDIS_URL'));
+    await client.ping();    // async setup — NestJS awaits this before proceeding
+    return client;
+  },
+  inject: [ConfigService],  // factory dependencies — resolved by DI before factory runs
+},
+
+// 3. useValue — plain value, no class required
+{
+  provide: 'APP_VERSION',
+  useValue: process.env.APP_VERSION ?? 'local',
+},
+
+// 4. useExisting — alias: LEGACY_TOKEN resolves to the same instance as NewService
+{
+  provide: 'LEGACY_TOKEN',
+  useExisting: NewService,
+},
+
+// Injecting non-class tokens:
+@Injectable()
+export class SomeService {
+  constructor(
+    @Inject('REDIS_CLIENT') private redis: Redis,
+    @Inject('APP_VERSION') private version: string,
+  ) {}
+}`,
+        }],
+      },
+      {
+        title: 'Controller',
+        description: 'A controller is the translation layer between a transport protocol and your domain — its only job is to extract inputs from the request and hand them to a service, never to hold business logic itself.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🎯', title: 'Controllers should be thin — extraction and delegation only',
+            body: 'A controller method should do three things: extract inputs from the request (@Param, @Body, @Query, @CurrentUser), call a service or command bus, return the result. If a controller method is longer than 10 lines it is doing too much. Business logic, validation beyond basic type-checking, and data assembly belong in services or handlers — not in controllers.',
+          },
+          {
+            type: 'insight', icon: '🔌', title: 'One controller class can handle multiple transports',
+            body: 'You can have a BettingController (@Controller) for HTTP and a BettingGrpcController (@Controller() with @GrpcMethod) for gRPC in the same module. They share the same injected services. @MessagePattern and @EventPattern turn a class into a microservice consumer handler for Kafka, Redis, TCP, etc. The controller type determines how NestJS routes the incoming message — the handler body is just TypeScript.',
+          },
+        ],
+        files: [{
+          filename: 'controller anatomy',
+          lang: 'typescript',
+          code: `@Controller('bets')               // route prefix: /bets
+export class BettingController {
+  constructor(
+    // Controllers can inject services, but never inject other controllers
+    private commandBus: CommandBus,
+    private queryBus: QueryBus,
+  ) {}
+
+  @Post()                          // maps POST /bets
+  @HttpCode(201)
+  @UseGuards(JwtAuthGuard)         // route-level guard — overrides global if needed
+  async placeBet(
+    @Body() dto: PlaceBetDto,      // parsed + validated by ValidationPipe
+    @CurrentUser() user: User,     // custom param decorator — reads from request
+  ) {
+    // Thin: extract inputs, fire command, return result — nothing else
+    return this.commandBus.execute(new PlaceBetCommand(user.id, dto));
+  }
+
+  @Get(':id')                      // maps GET /bets/:id
+  async getBet(@Param('id', ParseUUIDPipe) id: string) {
+    return this.queryBus.execute(new GetBetQuery(id));
+  }
+}
+
+// Microservice controller — same class shape, different decorators
+@Controller()
+export class BettingMicroserviceController {
+  @MessagePattern('bet.place')     // request-response via Kafka/TCP
+  async handlePlaceBet(@Payload() data: PlaceBetMessage) { ... }
+
+  @EventPattern('bet.settled')     // fire-and-forget event listener
+  async handleBetSettled(@Payload() event: BetSettledEvent) { ... }
+}`,
+        }],
+      },
+      {
+        title: 'Service',
+        description: '"Service" is not a NestJS concept at all — it is a team convention for an @Injectable() class that owns reusable business logic, distinguishing it from repositories, handlers, and factories that are also just providers under the hood.',
+        callouts: [
+          {
+            type: 'insight', icon: '🏗️', title: 'Service is a convention, @Injectable() is the mechanism',
+            body: 'What makes a class a "service" is that it is marked @Injectable() and registered in a module\'s providers array. That is it. The name "Service" signals: this class holds logic that is used by multiple consumers and should be injected. Compare with a "Repository" (data access), "Handler" (single command/event), "Factory" (creates instances), "Guard" (authorisation). These are all @Injectable() — the naming tells your team what role the class plays.',
+          },
+          {
+            type: 'pattern', icon: '🔗', title: 'Services should have one clear responsibility',
+            body: 'UserService that handles registration, login, profile update, password reset, avatar upload, and email verification is not one service — it is six services duct-taped together. When a service grows, split it by the reason it would change: AuthService changes when auth logic changes, UserProfileService changes when profile features change. The single responsibility principle is how you keep services testable and maintainable.',
+          },
+        ],
+      },
+      {
+        title: 'Guard',
+        description: 'A guard is a synchronous gate that runs before the handler and answers exactly one boolean question: is this identity allowed to perform this action — and if not, reject it before any business logic runs.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🛡️', title: 'Guards are for authorization, not authentication details',
+            body: 'Authentication (verifying a token is valid) is often done in middleware or a guard. Authorization (does this user have the right to do this thing?) is always a guard. The distinction matters for testing: an auth guard can be overridden with a mock in tests, while middleware runs below the NestJS testing layer. Use @UseGuards() at the controller or method level for specific permissions; use APP_GUARD for rules that apply everywhere (like rate limiting).',
+          },
+          {
+            type: 'insight', icon: '📋', title: 'Guards can read route metadata via Reflector',
+            body: 'SetMetadata(\'roles\', [\'admin\']) on a route handler stores metadata. In a guard, Reflector.getAllAndOverride(\'roles\', [context.getHandler(), context.getClass()]) reads it. This is how @Roles(\'admin\') decorator-driven RBAC works: the decorator stores the required roles, the guard reads them and checks the current user. getAllAndOverride means method-level metadata wins over class-level.',
+          },
+          {
+            type: 'tip', icon: '🔗', title: 'Guards run in order — later guards trust earlier ones',
+            body: 'In @UseGuards(AuthGuard, RolesGuard, FeatureGuard), AuthGuard sets request.user. RolesGuard reads request.user — it trusts AuthGuard already ran. FeatureGuard reads request.user.companyId — it trusts both. If you remove AuthGuard, the others break silently. Document these dependencies with explicit error messages: throw new Error("Did you forget AuthGuard?") when the expected request property is missing.',
+          },
+        ],
+      },
+      {
+        title: 'Interceptor',
+        description: 'An interceptor wraps the entire handler execution as an Observable, making it the only primitive in NestJS that can observe and transform both the incoming request and the outgoing response in a single class.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔁', title: 'Interceptors use RxJS — handle() returns an Observable',
+            body: 'next.handle() returns an Observable that emits the handler\'s return value. You can pipe() RxJS operators onto it: map() to transform responses, tap() to log without changing the value, catchError() to handle errors, timeout() to add per-route time limits. If you never used RxJS before, the mental model is: it\'s a Promise that you can transform before the caller sees it.',
+          },
+          {
+            type: 'insight', icon: '⏱️', title: 'Interceptors are how you add cross-cutting post-handler logic',
+            body: 'Middleware cannot see the response. Guards reject requests but cannot modify responses. Interceptors can do both — they run code before next.handle() (pre-handler) and pipe operators after it (post-handler). This makes them the right place for: response transformation (wrap all responses in { data: ..., meta: ... }), request timing (Date.now() before, subtract after), and response caching (return cached value without calling next.handle() at all).',
+          },
+        ],
+        files: [{
+          filename: 'interceptor patterns',
+          lang: 'typescript',
+          code: `@Injectable()
+export class TransformInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const start = Date.now();
+
+    return next.handle().pipe(
+      // map() transforms every emitted value — wraps the response
+      map(data => ({
+        data,
+        meta: { duration: Date.now() - start, timestamp: new Date().toISOString() },
+      })),
+
+      // tap() runs a side effect without changing the value — good for logging
+      tap(() => {
+        const req = context.switchToHttp().getRequest();
+        logger.log(\`\${req.method} \${req.url} — \${Date.now() - start}ms\`);
+      }),
+
+      // catchError() lets the interceptor handle or re-throw errors
+      catchError(err => {
+        logger.error('handler threw', err);
+        return throwError(() => err);  // re-throw — let the exception filter handle it
+      }),
+
+      // timeout() rejects if the handler takes too long
+      timeout(5000),  // 5 second per-route timeout
+    );
+  }
+}
+
+// Caching interceptor — short-circuits the handler entirely
+@Injectable()
+export class CacheInterceptor implements NestInterceptor {
+  async intercept(context: ExecutionContext, next: CallHandler) {
+    const key = context.switchToHttp().getRequest().url;
+    const cached = await this.cache.get(key);
+
+    if (cached) return of(cached);  // of() creates an Observable that emits immediately
+
+    return next.handle().pipe(
+      tap(response => this.cache.set(key, response, 60)),
+    );
+  }
+}`,
+        }],
+      },
+      {
+        title: 'Pipe',
+        description: 'A pipe is the last checkpoint before your handler sees a value — it coerces types, validates shapes, and throws immediately if the data is wrong, so your business logic never receives garbage input.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔍', title: 'Two distinct jobs: transformation and validation',
+            body: 'Transformation: ParseIntPipe turns the string "42" into the number 42. ParseUUIDPipe validates and passes through. ParseEnumPipe(StatusEnum) ensures the value is a valid enum member. Validation: ValidationPipe with class-validator decorators checks that a DTO has all required fields in the right shapes. You can compose both — ParseUUIDPipe ensures it\'s a valid UUID format, then the handler receives a string it can safely use as a DB key.',
+          },
+          {
+            type: 'insight', icon: '🎯', title: 'Pipes can be scoped to a single parameter',
+            body: '@Param("id", ParseUUIDPipe) applies the pipe only to the id parameter. @Body(new ValidationPipe({ whitelist: true })) applies a specific ValidationPipe config to just the body. This is more precise than a global pipe — useful when one route needs stricter validation than the global default, or when you need a different transform for a specific parameter.',
+          },
+        ],
+      },
+      {
+        title: 'Exception Filter',
+        description: 'An exception filter is the final safety net of the entire request pipeline — it intercepts any unhandled throw from any stage and decides what the client sees versus what gets logged, keeping internal state invisible to the outside world.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🎣', title: '@Catch() targets specific exception types',
+            body: '@Catch() with no arguments catches everything. @Catch(HttpException) catches only HttpException and subclasses. @Catch(InsufficientFundsException) catches only that specific domain exception. Typed filters run before the global catch-all, so you can handle specific exceptions with richer logic (extra logging, side effects like fraud alerts) while the global filter handles the rest.',
+          },
+          {
+            type: 'critical', icon: '🔒', title: 'Never leak internal state in exception responses',
+            body: 'The filter is where you decide what the client sees vs what goes in the logs. Log everything: userId, requestId, full stack trace, internal error context. Send to the client: a stable error code, a safe message, an HTTP status. If the handler throws an exception with the DB query that failed, the filter must strip that before responding. An attacker who sees "column balance_minor_units does not exist" learns your schema.',
+          },
+          {
+            type: 'insight', icon: '🏛️', title: 'extends BaseExceptionFilter to delegate response writing',
+            body: 'If you implement ExceptionFilter from scratch you must write the raw HTTP response yourself. If you extend BaseExceptionFilter you can intercept, reformat the exception as a new HttpException with a different body, and then call super.catch() to let NestJS write the response. This is the deskbird DeskbirdExceptionFilter approach — it normalises all exceptions to { statusCode, errorCode, message } without reimplementing response serialisation.',
+          },
+        ],
+      },
+      {
+        title: 'Middleware',
+        description: 'Middleware runs below the NestJS abstraction layer on the raw request object, before the framework has any awareness of routes or decorators — making it the right place for concerns that must run unconditionally on every request regardless of what NestJS does next.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔌', title: 'Right for raw request concerns: context setup, headers, logging',
+            body: 'Middleware is the right place for: setting up AsyncLocalStorage context (correlation IDs, tracing), reading and normalising raw headers, applying security headers (helmet), compression, and basic request logging before any parsing happens. If you need to read route metadata or the parsed body, use an interceptor instead — middleware runs too early.',
+          },
+          {
+            type: 'tip', icon: '📍', title: 'Registered via configure(), not providers array',
+            body: 'Middleware is not registered in the @Module() providers array. It is registered by implementing the NestModule interface and its configure(consumer: MiddlewareConsumer) method. consumer.apply(TracingMiddleware).forRoutes("*") applies it to all routes. consumer.apply(AuthMiddleware).forRoutes({ path: "admin/*", method: RequestMethod.ALL }) scopes it to specific paths.',
+          },
+        ],
+      },
+      {
+        title: 'Decorator',
+        description: 'A NestJS decorator is either configuring the DI container, binding a transport route, or storing metadata for a guard or interceptor to read later — and most of them do nothing at all without a corresponding guard or interceptor that actually enforces them.',
+        callouts: [
+          {
+            type: 'insight', icon: '🏷️', title: 'Most NestJS decorators just attach metadata — they do nothing by themselves',
+            body: '@Roles("admin") on a method does absolutely nothing on its own. It calls SetMetadata("roles", ["admin"]) which stores the value in a Reflect metadata key on the method. A guard later reads that value via Reflector. Remove the guard and @Roles() is completely inert. This is important: decorators like @Public() or @Timeout(3000) only work because some guard or interceptor is reading their metadata.',
+          },
+          {
+            type: 'pattern', icon: '🛠️', title: 'createParamDecorator — extract anything from the request',
+            body: 'createParamDecorator((data, ctx) => ...) creates a parameter decorator like @CurrentUser() or @CurrentPublicApiUser(). The data argument is whatever you pass in the decorator call — @CurrentUser("id") passes "id" as data. The ctx is the full ExecutionContext. This is how you encapsulate request-reading logic: instead of @Req() req: Request and then req.user in every method, you write @CurrentUser() user: User once and use it everywhere.',
+          },
+          {
+            type: 'pattern', icon: '🔗', title: 'applyDecorators — compose multiple decorators into one',
+            body: 'applyDecorators(UseGuards(JwtAuthGuard), Roles("admin"), ApiBearerAuth()) creates a single @AdminOnly() decorator that applies all three. This is how you build opinionated abstractions: a new engineer calls @AdminOnly() and gets auth + role check + Swagger annotation for free without knowing how any of them work. Used in deskbird for reusable Swagger response decorators like @ForbiddenResponse and @UnauthorizedResponse.',
+          },
+        ],
+        files: [{
+          filename: 'decorator patterns',
+          lang: 'typescript',
+          code: `// 1. Simple metadata decorator
+export const Roles = (...roles: string[]) => SetMetadata('roles', roles);
+export const Public = () => SetMetadata('isPublic', true);
+
+// Guard reads it back:
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+  canActivate(ctx: ExecutionContext): boolean {
+    // getAllAndOverride: method-level wins over class-level
+    const roles = this.reflector.getAllAndOverride<string[]>('roles', [
+      ctx.getHandler(),
+      ctx.getClass(),
+    ]);
+    if (!roles) return true;  // no @Roles() = no restriction
+    return roles.includes(ctx.switchToHttp().getRequest().user?.role);
+  }
+}
+
+// 2. Custom parameter decorator
+export const CurrentUser = createParamDecorator(
+  (field: keyof User | undefined, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    const user = request.user;
+    return field ? user?.[field] : user;  // @CurrentUser('id') returns just the id
+  },
+);
+
+// 3. Composite decorator with applyDecorators
+export const Auth = (...roles: string[]) =>
+  applyDecorators(
+    SetMetadata('roles', roles),
+    UseGuards(JwtAuthGuard, RolesGuard),
+    ApiBearerAuth(),          // Swagger: marks endpoint as requiring Bearer auth
+    ApiUnauthorizedResponse({ description: 'Unauthorized' }),
+  );
+
+// Usage — one decorator does all of the above
+@Auth('admin')
+@Delete(':id')
+async deleteUser(@Param('id') id: string) { ... }`,
+        }],
+      },
+      {
+        title: 'The Execution Order — putting it all together',
+        description: 'The execution order in NestJS is fixed and non-negotiable — Middleware → Guards → Interceptors → Pipes → Handler → Interceptors → Exception Filter — and understanding it is the single most important thing for debugging why something is undefined or a security check is not running.',
+        callouts: [
+          {
+            type: 'pattern', icon: '➡️', title: 'Inbound: Middleware → Guards → Interceptors (pre) → Pipes → Handler',
+            body: 'Middleware runs first on the raw request — no NestJS context. Guards run next and can reject the request. Interceptors run after guards and wrap the handler — their pre-handler code runs here. Pipes run just before the handler, on individual parameters. Then the handler executes. On the way out: Interceptors (post) transform the response. Exception Filters catch any throw from any of these stages.',
+          },
+          {
+            type: 'critical', icon: '⚠️', title: 'The order is fixed — you cannot swap guards and interceptors',
+            body: 'Guards always run before interceptors. Interceptors always run before pipes. Pipes always run before the handler. This is not configurable. Consequences: a guard cannot use data transformed by an interceptor (interceptors run after guards). A pipe cannot see what a guard put on the request (pipes run after guards, so actually it can read request.user). An interceptor can see what a guard set on the request (interceptors run after guards). Get this mental model right and you will never have mysterious "why is this undefined" bugs.',
+          },
+          {
+            type: 'insight', icon: '🔍', title: 'Exceptions flow backwards through the same chain',
+            body: 'If the handler throws, the exception travels back out: interceptors\' catchError() operators see it first, then exception filters. If a guard throws, the exception skips the handler and interceptors entirely and goes straight to the exception filter. This means your exception filter catches throws from guards, pipes, interceptors, and handlers — it is the single catch-all for the entire request pipeline.',
+          },
+        ],
+        files: [{
+          filename: 'full execution order',
+          lang: 'typescript',
+          code: `// Inbound request lifecycle (in order):
+//
+// 1. Middleware          — raw req/res, no NestJS context
+//    TracingMiddleware   → sets AsyncLocalStorage correlation-id
+//    helmet()            → security headers
+//
+// 2. Guards (left to right in @UseGuards)
+//    JwtAuthGuard        → verifies token, sets request.user
+//    RolesGuard          → reads @Roles() metadata, checks user.role
+//    ThrottlerGuard      → checks rate limit counter in Redis
+//
+// 3. Interceptors (pre-handler, top to bottom)
+//    LoggingInterceptor  → records start time
+//    TransformInterceptor→ (nothing to do yet on the way in)
+//
+// 4. Pipes (per parameter, left to right in handler signature)
+//    ParseUUIDPipe       → validates @Param('id') is a UUID
+//    ValidationPipe      → validates @Body() against DTO class
+//
+// 5. Handler executes
+//    controller method   → calls service → returns result
+//
+// Outbound response lifecycle (in reverse order):
+//
+// 6. Interceptors (post-handler, piped operators)
+//    TransformInterceptor→ wraps result in { data, meta }
+//    LoggingInterceptor  → logs duration
+//
+// 7. Exception Filter (if anything above threw)
+//    DeskbirdExceptionFilter → formats { statusCode, errorCode, message }
+//
+// Key: if a Guard throws → skips straight to step 7
+//      if a Pipe throws  → skips straight to step 7
+//      if a Handler throws → goes through Interceptors' catchError first, then step 7`,
+        }],
+      },
+    ],
+  },
+
+  {
     id: 'overview',
     title: 'Architecture Overview',
     subtitle: 'The full picture before we dive in',
@@ -3851,6 +4296,1708 @@ export const chapters = [
           { type: 'pattern', icon: '🔑', title: 'Partition by userId for event ordering', body: 'When emitting BET_PLACED with key: event.userId, all bets from the same user land in the same Kafka partition. Consumers processing that partition see events in order. This makes per-user RG limit tracking and fraud detection reliable — no out-of-order bet events to reconcile.' },
         ],
         files: [{ filename: 'Microservice Patterns Reference', lang: 'typescript', code: S.microservicePatterns }],
+      },
+    ],
+  },
+]
+
+// ─────────────────────────────────────────────────────────────────────────────
+// deskbird example app
+// ─────────────────────────────────────────────────────────────────────────────
+
+const D = {}
+
+D.appBootstrap = `// src/app/app.ts  — entry point
+// NestFastifyApplication = Fastify adapter instead of Express.
+// Fastify is 2× faster at raw HTTP throughput; required for HTTP/2 push on GCP.
+
+export async function createApp() {
+  const app = await NestFactory.create<NestFastifyApplication>(
+    AppModule,
+    // HTTP/2 only on Cloud (GCP Cloud Run), plain HTTP/1.1 locally
+    new FastifyAdapter(isCloudExecution() ? { http2: true } : undefined),
+    { bufferLogs: true },   // buffer until custom logger is wired
+  );
+
+  await configureApp(app);           // helmet + CORS (from @deskbird/rest-nestjs)
+  app.useLogger(app.get(DeskbirdLoggerService));
+  app.enableShutdownHooks();         // graceful SIGTERM drain
+
+  // Swagger: generate OpenAPI spec and write it to disk at startup.
+  // The CI pipeline diffs openapi-spec.json to catch unintended breaking changes.
+  const config = new DocumentBuilder()
+    .setTitle('Deskbird Public Api')
+    .setVersion('1.0')
+    .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' }, 'firebase-jwt')
+    .build();
+
+  const document = SwaggerModule.createDocument(app, config);
+
+  // Strip legacy /v1 path prefix from the public spec (internal routes are hidden)
+  const filteredPaths = Object.entries(document.paths).reduce(
+    (acc, [path, pathItem]) => {
+      if (!path.startsWith(LEGACY_PATH_PREFIX)) acc[path] = pathItem;
+      return acc;
+    },
+    {} as Record<string, PathItemObject>,
+  );
+  document.paths = filteredPaths;
+
+  fs.writeFileSync('./openapi-spec.json', JSON.stringify(document, null, 2));
+  SwaggerModule.setup('docs', app, document);
+
+  return app;
+}
+
+// src/app/app.module.ts
+@Module({
+  imports: [
+    ConfigModule.forRoot(),            // Zod-validated env at startup
+    SharedModule,                      // service clients + shared guards
+    DeskbirdAuthModule.forRootAsync({ useClass: DeskbirdAuthOptionsFactory }),
+    DeskbirdLoggingModule.forRootAsync({ useClass: DeskbirdLoggingOptionsFactory }),
+    TracingModule.forRoot(),           // GCP Cloud Trace propagation
+    DeskbirdErrorModule.forRoot(),     // global exception filter
+    ServiceAccountTokenProviderModule.forRootAsync({ useClass: ServiceAccountTokenProviderModuleFactory }),
+    JwtModule.register({ global: true }),
+    // Feature modules (one per domain entity)
+    UsersModule, BookingsModule, OfficesModule, KeysModule,
+    GroupsModule, ResourcesModule, ImportModule, SchedulingModule,
+    RoomsModule, FloorsModule, ZonesModule,
+  ],
+  providers: [
+    // Global ValidationPipe: transform: true coerces query strings to typed objects
+    { provide: APP_PIPE, useFactory: () => new ValidationPipe({ transform: true }) },
+  ],
+})
+export class AppModule {}`
+
+D.configureApp = `// libs/rest-nestjs/src/configureApp.ts
+// Shared bootstrap helper — every NestJS service in the monorepo calls this.
+// Centralises security headers so they cannot be forgotten per-service.
+
+export const configureApp = async (app: NestFastifyApplication) => {
+  // fastify-helmet: sets Content-Security-Policy, HSTS, X-Frame-Options,
+  // X-Content-Type-Options, Referrer-Policy, X-DNS-Prefetch-Control
+  await app.register(fastifyHelmet);
+
+  // noindex/nofollow on every response — API responses must never appear in search results
+  app.getHttpAdapter().getInstance().addHook('onRequest', (_req, reply, done) => {
+    reply.header('X-Robots-Tag', 'noindex, nofollow');
+    done();
+  });
+
+  // CORS: allowlist driven by CUSTOM_DOMAINS env var (set per-environment in Cloud Run)
+  app.enableCors(corsOptions(customDomains()));
+};
+
+// cors.ts
+export const corsOptions = (customDomains: string[]): CorsOptions => ({
+  origin: [
+    /\\.deskbird\\.app$/,        // all deskbird subdomains
+    /\\.deskbird\\.com$/,
+    ...customDomains,            // per-company white-label domains
+    ...(isDev() ? [/localhost/] : []),
+  ],
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Authorization', 'Content-Type', 'correlation-id', 'traceparent'],
+  credentials: true,
+})`
+
+D.authModule = `// libs/auth-nestjs/src/auth.module-definition.ts
+// ConfigurableModuleBuilder generates forRoot / forRootAsync / forFeature
+// with full async factory support (useClass / useFactory / useExisting).
+// This is the idiomatic NestJS pattern for publishable library modules.
+
+export type ModuleOptions = {
+  gcpProjectId: string;
+  numericProjectId: number;
+};
+
+export const { ConfigurableModuleClass, MODULE_OPTIONS_TOKEN } =
+  new ConfigurableModuleBuilder<MinimalModuleOptions>()
+    .setClassMethodName('forRoot')   // generates forRoot() and forRootAsync()
+    .build();
+
+// libs/auth-nestjs/src/auth.module.ts
+@Global()          // exported providers available everywhere without re-importing
+@Module({
+  imports: [
+    ScheduleModule.forRoot(),   // for certificate renewal cron
+    JwtModule.register({}),
+  ],
+  providers: [
+    CertificateProvider,
+    CertificateRenewalService,
+    AuthVerifier,
+    DeskbirdAuthModuleOptionsWithDefaultsFactory,
+    {
+      provide: MODULE_OPTIONS_WITH_DEFAULTS_TOKEN,
+      // async factory: fetches numericProjectId from GCP metadata endpoint
+      // if not provided explicitly — this means the module self-configures on GCP
+      useFactory: (factory: DeskbirdAuthModuleOptionsWithDefaultsFactory) => factory.create(),
+      inject: [DeskbirdAuthModuleOptionsWithDefaultsFactory],
+    },
+  ],
+  exports: [AuthVerifier, MODULE_OPTIONS_WITH_DEFAULTS_TOKEN],
+})
+export class DeskbirdAuthModule extends ConfigurableModuleClass {}
+
+// Usage in consuming app (app.module.ts):
+// DeskbirdAuthModule.forRootAsync({ useClass: DeskbirdAuthOptionsFactory })
+// where DeskbirdAuthOptionsFactory implements ModuleOptionsFactory<MinimalModuleOptions>`
+
+D.certificateProvider = `// libs/auth-nestjs/src/auth.certificateProvider.ts
+// Firebase issues JWT tokens signed with rotating X.509 certificates.
+// The certificates are fetched from Google APIs and cached in-memory.
+// CertificateRenewalService runs a @Cron job to refresh them before expiry.
+
+@Injectable()
+export class CertificateProvider {
+  // Two issuers supported:
+  //   securetoken.google.com/<project> → Firebase Auth (mobile/web users)
+  //   accounts.google.com              → Google SA tokens (service-to-service)
+  private readonly cache: Map<string, CertificateConfig>;
+
+  constructor(@Inject(MODULE_OPTIONS_WITH_DEFAULTS_TOKEN) options: ModuleOptions) {
+    this.cache = new Map([
+      [
+        \`https://securetoken.google.com/\${options.gcpProjectId}\`,
+        { url: 'https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com', certificates: {} },
+      ],
+      [
+        'https://accounts.google.com',
+        { url: 'https://www.googleapis.com/oauth2/v1/certs', certificates: {} },
+      ],
+    ]);
+  }
+
+  getCachedCertificateOrThrow({ iss, kid }: { iss: string; kid: string }): string {
+    const cert = this.cache.get(iss)?.certificates[kid];
+    if (!cert) throw new Error('iss or kid not found');
+    return cert;
+  }
+
+  async renewCertificates(iss: string, maxRetries = 3): Promise<{ maxAgeInSeconds: number }> {
+    const config = this.cache.get(iss);
+    // retry with 1s delay — Google APIs have transient 5xx
+    const { data, headers } = await retry({ times: maxRetries, delay: 1000 }, () => axios.get(config!.url));
+
+    // Respect Cache-Control: max-age from Google — re-fetch only when certs actually rotate
+    const maxAgeInSeconds = extractMaxAgeFromHeaders(headers['cache-control']) ?? 60;
+    this.cache.set(iss, { ...config!, certificates: data });
+    return { maxAgeInSeconds };
+  }
+}
+
+// libs/auth-nestjs/src/auth.verifier.ts
+@Injectable()
+export class AuthVerifier {
+  constructor(
+    private jwtService: JwtService,
+    private certificateProvider: CertificateProvider,
+  ) {}
+
+  verify(token: string): object {
+    // Decode without verifying first — need kid/iss to look up the right certificate
+    const decoded = this.jwtService.decode(token, { complete: true });
+    const kid = decoded?.header?.kid;
+    const iss = decoded?.payload?.iss;
+
+    if (!kid || !iss)
+      throw new DeskbirdHttpException(HttpStatus.UNAUTHORIZED, 'tokenIncompatible', 'Token format not compatible');
+
+    const certificate = this.certificateProvider.getCachedCertificateOrThrow({ kid, iss });
+
+    // Now verify signature — throws TokenExpiredError if expired
+    return this.jwtService.verify(token, { publicKey: certificate });
+  }
+}`
+
+D.guards = `// libs/guards-nestjs/src/requireFirebaseToken.ts
+// Three-layer guard chain (applied via @UseGuards in that order):
+//   1. RequireFirebaseToken  — verifies JWT, attaches tokenData to request
+//   2. RequireUser           — fetches full user from Users service, attaches user
+//   3. RequireUserRole       — checks user.role against allowed roles
+//
+// Why separate guards instead of one?
+//   Each layer is independently reusable.
+//   Some routes need token only (stats endpoints), some need role check.
+//   Guards run sequentially; later guards trust earlier ones already ran.
+
+@Injectable()
+export class RequireFirebaseToken implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const request = context.switchToHttp().getRequest<FastifyRequest>();
+    const [type, token] = request.headers.authorization?.split(' ') ?? [];
+
+    if (type !== 'Bearer' || !token)
+      throw new DeskbirdHttpException(401, 'tokenRequired', 'Resource access requires bearer token');
+
+    try {
+      const payload = this.authVerifier.verify(token);
+
+      // aud must match GCP project ID — prevents tokens from other projects being used
+      if (payload.aud !== this.authModuleOptions.gcpProjectId)
+        throw new DeskbirdHttpException(401, 'tokenIncompatible', 'Token audience mismatch');
+
+      // Zod parse: validates shape AND transforms snake_case → camelCase
+      // e.g. email_verified → emailVerified, sub → firebaseId
+      const result = UserTokenDataSchema.safeParse(payload);
+      if (!result.success)
+        throw new DeskbirdHttpException(401, 'tokenIncompatible', 'Token payload format not compatible');
+
+      // Attach to request — downstream guards and @CurrentUserTokenData() read this
+      (request as RequestWithUserTokenData).userTokenData = result.data;
+      return true;
+    } catch (error) {
+      if (error instanceof DeskbirdHttpException) throw error;
+      if (error instanceof TokenExpiredError)
+        throw new DeskbirdHttpException(401, 'tokenExpired', 'Bearer token is expired');
+      throw new DeskbirdHttpException(401, 'unauthorized', 'Token invalid or expired');
+    }
+  }
+}
+
+// RequireUser — fetches user from Users service and attaches to request
+@Injectable()
+export class RequireUser implements CanActivate {
+  constructor(private usersClient: UsersClient) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest<FastifyRequest>();
+    // Relies on RequireFirebaseToken having run first
+    if (!isRequestWithUserTokenData(request))
+      throw new Error('Did you forget to call RequireFirebaseToken before?');
+
+    const user = await this.usersClient.findOne({ id: request.userTokenData.firebaseId }).then(unwrapOrThrow);
+    if (!user) throw new DeskbirdHttpException(404, 'user_not_found', 'User not found');
+
+    (request as RequestWithUser).user = user;
+    return true;
+  }
+}
+
+// RequireUserRole — uses mixin() for parameterised guard instances
+// mixin() creates a new class with the config baked in,
+// making each instance a distinct injectable for NestJS's DI container.
+export const RequireUserRole = ({ oneOf, allowDeskbirdAdmins }: {
+  oneOf: DeskbirdUser['role'][];
+  allowDeskbirdAdmins?: boolean;
+}) => {
+  class RequireUserRoleGuardMixin implements CanActivate {
+    canActivate(context: ExecutionContext): boolean {
+      const request = context.switchToHttp().getRequest<FastifyRequest>();
+
+      // Super-admin bypass: deskbird internal staff can access any company
+      if (allowDeskbirdAdmins && request.userTokenData?.isDeskbirdAdmin) return true;
+
+      if (!isRequestWithUser(request))
+        throw new Error('Did you forget to call RequireUser before?');
+
+      if (!oneOf.includes(request.user.role))
+        throw new DeskbirdHttpException(403, 'forbidden', 'You are not allowed to access this resource');
+
+      return true;
+    }
+  }
+  return mixin(RequireUserRoleGuardMixin);
+};
+
+// Usage on a controller:
+// @UseGuards(RequireFirebaseToken, RequireUser, RequireUserRole({ oneOf: ['admin'] }))
+
+// RequireFeatures — feature-flag guard that calls FeatureManager service
+// The featureAccessContextProvider is injected at the call site so the guard
+// knows which company/user context to check features for.
+export const RequireFeatures =
+  (contextProvider: FeatureAccessContextProvider) =>
+  (conditionType: 'all' | 'any', ...features: string[]) => {
+    @Injectable()
+    class RequireFeaturesMixin implements CanActivate {
+      constructor(@Inject(FeatureManagerClient) private client: FeatureManagerClient) {}
+
+      async canActivate(ctx: ExecutionContext): Promise<boolean> {
+        const context = await contextProvider(ctx);
+        if (!context) return true;  // no context = no company to check against
+
+        const result = await this.client.getFeatureAccess(context);
+        if (!result.success)
+          throw new DeskbirdHttpException(500, 'internal_error', 'Failed to get feature access');
+
+        const enabled = result.data.features;
+        const allowed = conditionType === 'all'
+          ? features.every(f => enabled.includes(f))
+          : features.some(f => enabled.includes(f));
+
+        if (!allowed) throw new DeskbirdHttpException(403, 'forbidden', 'Feature disabled');
+        return true;
+      }
+    }
+    return mixin(RequireFeaturesMixin);
+  };
+
+// @CurrentUserTokenData — custom param decorator to extract token data
+export const CurrentUserTokenData = createParamDecorator((_, ctx: ExecutionContext): UserTokenData => {
+  const request = ctx.switchToHttp().getRequest<FastifyRequest>();
+  if (!isRequestWithUserTokenData(request))
+    throw new Error('Missing token payload. Did you forget RequireFirebaseToken?');
+  return request.userTokenData;
+});`
+
+D.serviceClient = `// libs/service-clients/src/serviceClient.class.ts
+// Base class for all inter-service HTTP clients.
+// Every internal service (bookings, users, offices, etc.) has a concrete client
+// that extends this class and adds typed methods (findOne, findMany, create...).
+
+export abstract class ServiceClient {
+  protected readonly api: AxiosInstance;
+
+  constructor(options: ServiceClientOptions) {
+    const axiosClient = axios.create({
+      baseURL: options.baseUrl.replace(/\\/$/, ''),
+      timeout: options.timeout ?? 10000,
+      headers: { 'User-Agent': \`@deskbird/service-clients/\${version}\` },
+    });
+
+    // Automatic retry on network errors and idempotent requests (GET/HEAD/OPTIONS)
+    // exponentialDelay: 1s, 2s, 4s — avoids thundering herd on downstream blip
+    if (options.retryConfig) {
+      axiosRetry(axiosClient, {
+        retries: options.retryConfig.retries ?? 2,
+        retryDelay: exponentialDelay,
+        shouldResetTimeout: true,
+        retryCondition: (err) => isNetworkOrIdempotentRequestError(err) || isIdempotentTimeoutError(err),
+      });
+    }
+
+    // Response interceptor: transform axios errors into typed ServiceError
+    // so callers can switch on errorCode rather than parsing arbitrary HTTP bodies
+    axiosClient.interceptors.response.use(
+      response => response,
+      error => {
+        if (isAxiosError(error) && error.response?.data?.errorCode) {
+          throw new ServiceError(
+            error.response.status,
+            error.response.data.errorCode,
+            error.response.data,
+            \`\${error.config?.method?.toUpperCase()} \${error.config?.baseURL}\${error.config?.url}\`,
+          );
+        }
+        throw error;
+      },
+    );
+
+    // Request interceptor: inject auth + tracing headers on every outgoing request
+    // headerFactories are provided by the consuming app:
+    //   authorization: () => serviceAccountTokenProvider.getToken(audience)
+    //   correlation-id: () => tracingService.getCorrelationId()
+    //   traceparent:    () => tracingService.getTraceparent()
+    axiosClient.interceptors.request.use(async config => {
+      for (const [header, factory] of Object.entries(options.headerFactories)) {
+        const value = await factory();
+        if (value) config.headers[header] = value;
+      }
+      return config;
+    });
+
+    this.api = axiosClient;
+  }
+
+  // Zod validation of responses — enabled in non-prod environments.
+  // In prod it falls back to the raw data (avoids breaking on minor schema drift).
+  // Parsing errors are reported via onParsingError (Sentry/logging) but not thrown.
+  protected parseData<T extends z.ZodTypeAny>(schema: T, data: unknown): z.infer<T> {
+    const result = schema.safeParse(data);
+    if (!result.success) {
+      this.serviceOptions.onParsingError?.(result.error);
+      if (this.validateResponses) throw result.error;
+      return data as z.infer<T>;  // graceful degradation in prod
+    }
+    return result.data;
+  }
+}
+
+// ServiceResult<T, ErrorCode> — typed success/error discriminated union
+export type ServiceResult<T, ErrorCode extends string | undefined> =
+  | { success: true; data: T }
+  | { success: false; error: Error; errorCode?: ErrorCode };
+
+// Example concrete client (BookingsClient):
+export class BookingsClient extends ServiceClient {
+  async findOne(params: { id: string; companyId: string }): ServiceResultPromise<Booking, 'not_found'> {
+    try {
+      const { data } = await this.api.get(\`/bookings/\${params.id}\`, { params: { companyId: params.companyId } });
+      return { success: true, data: this.parseData(BookingSchema, data) };
+    } catch (err) {
+      if (err instanceof ServiceError && err.statusCode === 404)
+        return { success: false, error: err, errorCode: 'not_found' };
+      throw err;
+    }
+  }
+}`
+
+D.errorHandling = `// libs/errors-nestjs/src/deskbirdError.classes.ts
+// DeskbirdHttpException is a plain Error subclass — NOT HttpException.
+// This keeps domain logic free of HTTP: services throw it, the filter maps to HTTP.
+// The errorCode string is a stable contract for API clients
+// (they switch on errorCode, not on HTTP status, for localisation).
+
+export class DeskbirdHttpException extends Error {
+  constructor(
+    readonly status: number,      // HTTP status code
+    readonly errorCode: string,   // stable machine-readable code: 'tokenExpired', 'user_not_found'
+    message: string,              // human-readable, may be shown to developer
+    readonly cause?: unknown,     // original error for server-side logging only
+    readonly details?: unknown,   // extra context (validation errors, field names)
+  ) {
+    super(message);
+  }
+}
+
+// libs/errors-nestjs/src/deskbirdError.exceptionfilter.ts
+// Extends BaseExceptionFilter (not implements ExceptionFilter).
+// BaseExceptionFilter handles the actual HTTP response writing;
+// we intercept, reformat, then delegate to super.catch().
+export class DeskbirdExceptionFilter extends BaseExceptionFilter {
+  catch(exception: unknown, host: ArgumentsHost) {
+    // Our own exceptions: use errorCode + status directly
+    if (exception instanceof DeskbirdHttpException) {
+      return this.formatException(
+        { statusCode: exception.status, errorCode: exception.errorCode,
+          message: exception.message, details: exception.details },
+        host,
+      );
+    }
+
+    // NestJS built-in exceptions: normalize to our error shape
+    if (exception instanceof HttpException) {
+      const status = exception.getStatus();
+      if (status === 400) {
+        // ValidationPipe throws BadRequestException with array of messages in body.message
+        const response = exception.getResponse();
+        return this.formatException({
+          statusCode: 400, errorCode: 'badRequest', message: 'Bad Request',
+          details: typeof response === 'object' && 'message' in response ? response.message : response,
+        }, host);
+      }
+      if (status === 404) return this.formatException({ statusCode: 404, errorCode: 'notFound', message: 'Resource not found' }, host);
+      if (status === 429) return this.formatException({ statusCode: 429, errorCode: 'tooManyRequests', message: 'Too many requests' }, host);
+    }
+
+    // Unhandled: log server-side, return generic 500 — never leak internals
+    this.logger.error('unhandled error', exception);
+    return this.formatException({ statusCode: 500, errorCode: 'internalServerError', message: 'Sorry, an unexpected error occurred.' }, host);
+  }
+
+  // Wire it up globally in main.ts:
+  // app.useGlobalFilters(new DeskbirdExceptionFilter(app.get(HttpAdapterHost).httpAdapter));
+  // Or via DeskbirdErrorModule.forRoot() which registers it as APP_FILTER
+}`
+
+D.bookingsController = `// src/features/bookings/apis/rest/controllers/bookings.controller.ts
+// Public API controller for desk bookings.
+// Auth flow: RequirePublicApiToken verifies the API key (not Firebase JWT),
+// then RequireFeatures checks the company has PUBLIC_API enabled.
+// The feature gate prevents upselling bypass — customers must subscribe to get API access.
+
+@ApiTags('Bookings')
+@ApiKeyAuthorizationHeader          // Swagger: shows API key auth header in docs
+@Controller([
+  \`\${LEGACY_PATH_PREFIX}/bookings\`, // /v1/bookings  (kept for backwards compat)
+  '/bookings',                       // /bookings     (new path)
+])
+@UseGuards(
+  RequirePublicApiToken,
+  RequireFeatures('PUBLIC_API', 'RESOURCE_BOOKING_PUBLIC_API'), // both flags required
+)
+export class BookingsController {
+  @Get()
+  public async getBookings(
+    @Query() { startDate, endDate, ids, officeIds, statuses, limit, offset }: GetBookingsQuery,
+    @CurrentPublicApiUser() { companyUuid }: PublicApiUser,  // extracted from verified token
+  ): Promise<PaginatedBookingResponse> {
+    return this.getBookingsService.getBookings({
+      companyId: companyUuid,
+      startDate, endDate,
+      ids: ids?.split(','),
+      officeIds: officeIds?.split(','),
+      statuses: statuses?.split(',') as BookingStatus[],
+      limit, offset,
+    });
+  }
+
+  @Post()
+  @HttpCode(200)
+  public async createBooking(
+    @Body() dto: CreateBookingDto,
+    @CurrentApiTokenCreatedById() createdBy: string,  // creator from token claims
+    @CurrentPublicApiUser() { companyId }: PublicApiUser,
+  ): Promise<BookingResponse> {
+    const bookingModel = createBookingMapper(dto);
+    const [result] = await this.bookingActions.createBookings({
+      bookings: [bookingModel], creatorId: createdBy, companyId,
+    });
+
+    // createBookings returns a discriminated union per booking
+    if (!result.success)
+      throw new DeskbirdHttpException(result.error.statusCode, result.error.errorCode, result.error.message);
+
+    return result.booking;
+  }
+
+  @Patch('/:bookingId/cancel')
+  @HttpCode(204)  // 204 No Content: successful mutation with no response body
+  public async cancel(
+    @Param(ValidationPipe) { bookingId }: GetSingleBookingQuery,
+    @CurrentApiTokenCreatedById() createdBy: string,
+  ): Promise<void> {
+    await this.bookingActions.cancelBooking(bookingId, createdBy);
+  }
+
+  @Patch('/:bookingId/checkIn')
+  @HttpCode(204)
+  public async checkIn(
+    @Param(ValidationPipe) { bookingId }: GetSingleBookingQuery,
+    @Body() { resourceId }: CheckInDto,
+    @CurrentApiTokenCreatedById() createdBy: string,
+  ): Promise<void> {
+    await this.bookingActions.checkIn(bookingId, resourceId, createdBy);
+  }
+}
+
+// BookingActionsService — orchestrates multiple service clients
+// It fan-outs to Bookings, Users, Guests, Resources, Offices clients in parallel
+// after creating bookings, to assemble the full response object.
+@Injectable()
+export class BookingActionsService {
+  constructor(
+    private bookingsClient: BookingsClient,
+    private guestsClient: GuestsClient,
+    private usersClient: UsersClient,
+    private resourcesClient: ResourcesClient,
+    private officesClient: OfficesClient,
+  ) {}
+
+  async createBookings({ bookings, creatorId, companyId }) {
+    const results = await this.bookingsClient.createBookings(bookings, { userUuid: creatorId })
+      .then(result => unwrapOrThrowMapped(result, (code) => {
+        // Map domain error codes to HTTP exceptions
+        switch (code) {
+          case 'anonymousBookingNotAllowed': throw new DeskbirdHttpException(403, 'forbidden', 'Anonymous booking not allowed');
+          case 'deskAlreadyOccupied':        throw new DeskbirdHttpException(400, 'badRequest', 'Desk already occupied');
+          case 'officeClosed':               throw new DeskbirdHttpException(403, 'forbidden', 'Office closed');
+        }
+      }));
+
+    // Parallel fan-out to enrich booking with related entities
+    const createdBookings = results.filter(b => b.success).map(b => b.booking);
+    const [guests, users, resources, offices] = await Promise.all([
+      this.getGuests(uniq(compact(createdBookings.map(b => b.guestId)))),
+      this.getUsers(uniq(compact(createdBookings.map(b => b.userId)))),
+      this.getResources(uniq(compact(createdBookings.map(b => b.resourceId)))),
+      this.getOffices(companyId, createdBookings.map(b => b.officeId)),
+    ]);
+
+    const mapper = bookingMapper(
+      new Map(guests.map(g => [g.id, g])),
+      new Map(users.map(u => [u.id, u])),
+      new Map(resources.map(r => [r.id, r])),
+      new Map(offices.map(o => [o.id, o])),
+    );
+
+    return results.map(r => r.success
+      ? { success: true, booking: mapper(r.booking) }
+      : { success: false, error: mapBookingError(r.error) }
+    );
+  }
+}`
+
+D.tracing = `// libs/tracing-nestjs/src/tracing.middleware.ts
+// Two tracing primitives — middleware for HTTP, interceptor for Pub/Sub.
+//
+// TracingMiddleware runs on every HTTP request.
+// It sets correlation-id and traceparent in AsyncLocalStorage (via TracingService).
+// All downstream service clients read these via tracingService.getCorrelationId()
+// and inject them into outgoing request headers — enabling cross-service trace linkage.
+
+@Injectable()
+export class TracingMiddleware implements NestMiddleware {
+  constructor(private tracingService: TracingService) {}
+
+  use(req: FastifyRequest['raw'], _res: FastifyReply['raw'], next: () => void) {
+    return this.tracingService.runWithTracingInformation(
+      {
+        // Accept correlation-id from the caller (frontend/CDN) or generate a new one
+        correlationId: () => getHeader(req, 'correlation-id') || getHeader(req, 'x-transaction-id'),
+        // W3C traceparent: 00-<trace-id>-<parent-id>-<flags>
+        traceparent: () => getHeader(req, 'traceparent'),
+        requestRoute: () => \`\${req.method} \${req.url}\`,
+      },
+      () => next(),  // executes the rest of the request within the tracing context
+    );
+  }
+}
+
+// TracingInterceptor — for Pub/Sub message handlers (NestJS controllers receiving POST)
+// When GCP Pub/Sub delivers a message to an HTTP endpoint, the original traceparent
+// is in the message attributes, not in HTTP headers.
+// This interceptor reads from req.body.message.attributes for Pub/Sub payloads.
+@Injectable()
+export class TracingInterceptor implements NestInterceptor {
+  constructor(private tracingService: TracingService) {}
+
+  intercept(context: ExecutionContext, next: CallHandler) {
+    const req = context.switchToHttp().getRequest<FastifyRequest>();
+
+    if (isPubSubMessageWithAttributes(req.body)) {
+      // Override the HTTP-header-based tracing set by middleware
+      // with the tracing context from inside the Pub/Sub message
+      this.tracingService.setTracing({
+        correlationId: req.body.message.attributes['correlation-id'],
+        traceparent: req.body.message.attributes.traceparent,
+      });
+    }
+
+    return next.handle();
+  }
+}
+
+// Wire up in AppModule:
+// export class AppModule implements NestModule {
+//   configure(consumer: MiddlewareConsumer) {
+//     consumer.apply(TracingMiddleware).forRoutes('*');
+//   }
+// }
+// And in the controller for Pub/Sub endpoints:
+// @UseInterceptors(TracingInterceptor)`
+
+D.rateLimiting = `// src/shared/guards/tokenRateLimiter.guard.ts
+// Token-based rate limiting (not IP-based).
+// IP-based limits fail on shared NAT (office building: 500 users, same IP).
+// Token-based: each API key gets its own rate limit bucket.
+
+@Injectable()
+export class TokenRateLimiterGuard extends RateLimiterGuard {
+  constructor(
+    @Inject('RATE_LIMITER_OPTIONS') options: RateLimiterOptions,
+    reflector: Reflector,
+    private jwtService: JwtService,
+  ) {
+    super(options, reflector);
+  }
+
+  // Override getIpFromRequest() — the base class calls this to get the bucket key
+  protected getIpFromRequest(request: FastifyRequest): string {
+    const identifier = this.extractRequestIdentifier(request);
+    if (!identifier) throw DeskbirdInvalidApiKeyTokenError;
+    // SHA-256 hash: stable, unique per token, doesn't store the raw token in Redis
+    return createHash('sha256').update(identifier).digest('hex');
+  }
+
+  private extractRequestIdentifier(request: FastifyRequest): string | undefined {
+    const authorization = request.headers['authorization'];
+    if (!authorization) return undefined;
+    const token = authorization.trim().replace(/^(Bearer|ApiKey)\\s+/i, '');
+    const decoded = this.jwtService.decode(token);
+    // sub = IAM service account UUID; keyId = legacy API key identifier
+    return decoded?.sub || decoded?.keyId;
+  }
+}
+
+// Config (from config.schema.ts, validated with Zod at startup):
+// RATE_LIMIT_DURATION_SECONDS: 1       // 1-second sliding window
+// RATE_LIMIT_POINTS: 10                // 10 requests per second per token
+// EXEC_EVENLY_MIN_DELAY_MS: 50         // smooth bursty traffic over the window
+// REDIS_HOST/PORT/PASSWORD: string     // rate limit state stored in Redis
+//
+// Applied as a global guard in SharedModule, wrapping all public API routes.`
+
+D.configSchema = `// src/config/config.schema.ts — Zod schema for environment validation
+// Zod's .transform() on the main object lets you derive computed values
+// (DESKBIRD_AUDIENCE) from validated fields at startup, not at use time.
+
+export const appEnvSchema = z
+  .object({
+    GCP_PROJECT_ID:                 z.string(),
+    DESKBIRD_API_BASE_URL:          z.string(),
+    FEATURE_MANAGER_BASE_URL:       z.string(),
+    GENERIC_BOOKINGS_SERVICE_URL:   z.string(),
+    PUBLIC_API_KEY_GENERATION_SECRET: z.string(),
+    PORT:                           z.coerce.number().default(3000),
+    LOG_LEVEL:                      z.enum(['debug', 'info', 'warn', 'error']).default('info'),
+    NUMERIC_PROJECT_ID:             z.coerce.number().optional(),
+    FAKE_SERVICE_ACCOUNT_TOKENS:    z.enum(['true', 'false']).transform(v => v === 'true').default('false'),
+    IAM_SERVICE_URL:                z.string(),
+    IAM_SIGNING_KEY_PUBLIC_KEY:     z.string(),
+    RATE_LIMIT_DURATION_SECONDS:    z.coerce.number().int().min(1).default(1),
+    RATE_LIMIT_POINTS:              z.coerce.number().int().min(1).default(10),
+    REDIS_HOST:                     z.string(),
+    REDIS_PORT:                     z.coerce.number().default(6378),
+    REDIS_PASSWORD:                 z.string().optional(),
+  })
+  // Derived value: computed once from validated fields, used everywhere
+  .transform(data => ({ ...data, DESKBIRD_AUDIENCE: \`deskbird-api.\${data.GCP_PROJECT_ID}\` }));
+
+// Config module wraps this in NestJS ConfigModule:
+// src/config/config.module.ts
+@Module({
+  imports: [
+    NestConfigModule.forRoot({
+      validate: (config) => {
+        const result = appEnvSchema.safeParse(config);
+        if (!result.success) {
+          // Crash at startup with a clear error listing all missing/invalid env vars.
+          // "Missing REDIS_HOST" is 10× easier to debug than a connection error at 3am.
+          console.error('Invalid environment config:', result.error.format());
+          process.exit(1);
+        }
+        return result.data;
+      },
+      isGlobal: true,
+    }),
+  ],
+  providers: [ConfigService],
+  exports: [ConfigService],
+})
+export class ConfigModule {
+  static forRoot() { return { module: ConfigModule }; }
+}`
+
+export const deskbirdChapters = [
+  {
+    id: 'deskbird-intro',
+    title: 'Architecture Overview',
+    subtitle: 'How the system is structured and why it was built that way',
+    tag: { label: 'Intro', color: '#58a6ff', bg: '#0d1f33' },
+    description: 'deskbird is a B2B SaaS desk booking platform used by enterprise companies to manage hybrid work. Employees book desks, parking spots, and meeting rooms. The backend is a set of NestJS microservices running on GCP Cloud Run, backed by a shared internal library monorepo that standardises auth, error handling, tracing, and inter-service communication across every service.',
+    sections: [
+      {
+        title: 'System Architecture',
+        callouts: [
+          {
+            type: 'insight', icon: '🏗️', title: 'Many small NestJS services, one shared library monorepo',
+            body: 'Each domain (bookings, users, offices, resources, rooms, floors, IAM, feature-manager, notifications...) is a separate NestJS service deployed independently on GCP Cloud Run. They share behaviour through @deskbird/* npm packages published from a separate monorepo (deskbird-libs). This means auth logic, error shapes, tracing, and service client patterns are written once and versioned — not copy-pasted across 15 repos.',
+          },
+          {
+            type: 'pattern', icon: '🌐', title: 'public-api is the external gateway',
+            body: 'The public-api service is the only entry point for external API consumers (enterprise customers integrating via REST). It authenticates API keys, enforces feature flags, and delegates to internal services via HTTP. It never owns any data — it is purely an orchestration layer. Internal services are not publicly reachable.',
+          },
+          {
+            type: 'pattern', icon: '🔀', title: 'Two separate auth systems: Firebase JWT for users, Service Account tokens for services',
+            body: 'End users (employees, admins) authenticate with Firebase Auth — the client gets a Firebase JWT and sends it as a Bearer token. Internal service-to-service calls use GCP Service Account tokens (short-lived JWTs signed by Google). The ServiceAccountTokenProvider fetches and caches these tokens. The two flows never mix: user-facing endpoints use RequireFirebaseToken, internal endpoints use RequireGcpServiceAccountToken.',
+          },
+        ],
+      },
+      {
+        title: 'Key Architectural Decisions',
+        callouts: [
+          {
+            type: 'insight', icon: '📡', title: 'HTTP (Axios) for all inter-service communication — no gRPC',
+            body: 'All sync calls between services go over plain HTTP using the ServiceClient base class. This was chosen for operational simplicity: no protobuf schemas to maintain, no gRPC server setup per service, easier local development and debugging with curl/Postman. The trade-off is slightly higher latency and larger payloads compared to gRPC, acceptable for a desk-booking workload that is not latency-critical.',
+          },
+          {
+            type: 'pattern', icon: '📨', title: 'GCP Pub/Sub for async events — not Kafka',
+            body: 'Async domain events (booking created, user updated, office changed) are published via GCP Pub/Sub. Since the entire stack runs on GCP, Pub/Sub is the natural choice — no separate Kafka cluster to operate. Pub/Sub messages are delivered to NestJS HTTP endpoints (push subscriptions) rather than a consumer loop, which fits Cloud Run\'s request-driven scaling model.',
+          },
+          {
+            type: 'tip', icon: '⚡', title: 'Fastify over Express — HTTP/2 on Cloud Run',
+            body: 'Every NestJS service uses the Fastify adapter instead of Express. Fastify is roughly 2× faster at raw HTTP throughput, which reduces Cloud Run CPU time and therefore cost at scale. On Cloud Run, HTTP/2 is enabled in production (isCloudExecution() check) for header compression and request multiplexing — relevant when a single user action triggers several internal service calls.',
+          },
+          {
+            type: 'insight', icon: '🚦', title: 'Feature flags as business gates, not just kill-switches',
+            body: 'The FeatureManagerClient is called on nearly every public endpoint via RequireFeatures guards. Flags like PUBLIC_API, SCIM, RESOURCE_BOOKING_PUBLIC_API are not deployment toggles — they are the upselling mechanism. A company on the basic plan hits a 403 on API endpoints until they upgrade. This means the feature flag system is part of the billing model, not just an ops tool.',
+          },
+          {
+            type: 'pattern', icon: '✅', title: 'Zod everywhere — config validation, response validation, token parsing',
+            body: 'Zod is used in three distinct places: (1) config.schema.ts validates all env vars at startup and crashes the process if anything is wrong; (2) ServiceClient.parseData() validates responses from downstream services to catch schema drift early; (3) UserTokenDataSchema in RequireFirebaseToken parses and transforms the JWT payload, converting snake_case fields and validating email format. class-validator is only used for incoming request DTOs via ValidationPipe.',
+          },
+          {
+            type: 'critical', icon: '🔒', title: 'Stable errorCode strings are the real API contract',
+            body: 'Every error response has a machine-readable errorCode string: "tokenExpired", "user_not_found", "forbidden". Enterprise API consumers switch on errorCode in their integration code. HTTP status codes are secondary and can be adjusted; errorCode strings are frozen once released. This was a deliberate design decision to make the API resilient to HTTP semantics debates (is "booking not found" a 404 or 422?).',
+          },
+        ],
+      },
+      {
+        title: 'How a Request Flows Through the System',
+        callouts: [
+          {
+            type: 'pattern', icon: '➡️', title: 'Typical public API request lifecycle',
+            body: '1. Client sends Bearer token (API key JWT) to public-api\n2. TokenRateLimiterGuard checks the per-token rate limit bucket in Redis\n3. RequirePublicApiToken verifies the JWT and calls IAM service to confirm the service account is active\n4. RequireFeatures calls FeatureManager to check the company has the required feature flags\n5. Controller handler runs — calls one or more internal services via ServiceClient (HTTP + SA token)\n6. ServiceClient injects correlation-id and traceparent headers on every outgoing call\n7. Response is assembled (possibly with Promise.all fan-out to multiple services) and returned\n8. DeskbirdExceptionFilter catches any DeskbirdHttpException and formats { statusCode, errorCode, message }',
+          },
+          {
+            type: 'insight', icon: '🔍', title: 'Tracing connects the whole chain',
+            body: 'Every inbound HTTP request passes through TracingMiddleware, which reads (or generates) a correlation-id and W3C traceparent and stores them in AsyncLocalStorage via TracingService. Every outgoing ServiceClient call reads from that AsyncLocalStorage and injects the same headers. This means a single user action produces a linked trace across public-api → bookings-service → users-service → offices-service, all correlated by the same correlation-id in GCP Cloud Trace.',
+          },
+        ],
+      },
+      {
+        title: 'The Shared Library Monorepo (deskbird-libs)',
+        description: 'deskbird-libs is an npm workspaces monorepo that publishes @deskbird/* packages consumed by every NestJS service. The idea is simple: any code that would otherwise be copy-pasted across services lives in a lib instead. Each lib is a focused NestJS module — it exports providers, guards, or utilities and nothing else.',
+        callouts: [
+          {
+            type: 'pattern', icon: '📦', title: 'What lives in libs vs what lives in each service',
+            body: 'libs owns: how to verify a Firebase token, what an error response looks like, how to propagate a trace, how to call another service. Each service owns: its own domain logic, its own controllers and DTOs, its own config schema. The boundary is deliberate — libs never imports from a specific service, services always import from libs.',
+          },
+          {
+            type: 'insight', icon: '🔄', title: 'Versioned and published — not a symlink or path alias',
+            body: 'Each lib is a proper npm package with its own package.json and version number. Services depend on @deskbird/auth-nestjs@1.2.3 in their package.json. When a lib changes, it gets a new version, and each service opts in by bumping the version. This means a breaking change in a lib does not silently affect all services — services upgrade on their own schedule.',
+          },
+        ],
+      },
+      {
+        title: '@deskbird/auth-nestjs',
+        description: 'Handles Firebase JWT verification. Consuming a service calls DeskbirdAuthModule.forRootAsync() once in AppModule and gets AuthVerifier injected anywhere it is needed.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔑', title: 'What it provides',
+            body: 'AuthVerifier — the @Injectable() service that verifies a token string and returns the decoded payload. CertificateProvider — fetches and caches Google\'s public X.509 certificates (two issuers: Firebase Auth and Google SA). CertificateRenewalService — a @Cron job that refreshes certs before they expire based on the Cache-Control max-age from Google\'s API. The module is @Global() so AuthVerifier is available everywhere after one import.',
+          },
+          {
+            type: 'insight', icon: '⚙️', title: 'How a service wires it in',
+            body: 'AppModule imports DeskbirdAuthModule.forRootAsync({ useClass: DeskbirdAuthOptionsFactory }). The factory class gets ConfigService injected and returns { gcpProjectId }. The module uses ConfigurableModuleBuilder so the forRootAsync pattern is generated automatically — the lib author does not write boilerplate async factory handling by hand.',
+          },
+          {
+            type: 'tip', icon: '🌐', title: 'GCP Metadata endpoint for numeric project ID',
+            body: 'Firebase requires the numeric GCP project ID to validate token audience. If not set as NUMERIC_PROJECT_ID env var, the module fetches it at startup from the GCP metadata server (http://metadata.google.internal) — only reachable on GCP. Locally, the env var must be set. This self-configuration pattern means Cloud Run services need zero Firebase-specific env vars.',
+          },
+        ],
+      },
+      {
+        title: '@deskbird/guards-nestjs',
+        description: 'Provides the four guard classes and two param decorators used across all NestJS services. Guards are applied via @UseGuards() on controllers or routes.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🛡️', title: 'RequireFirebaseToken',
+            body: 'Reads the Authorization header, calls AuthVerifier.verify(), then parses the payload with UserTokenDataSchema (Zod). Zod transforms the raw JWT payload: renames email_verified→emailVerified, sub→firebaseId, validates email format, checks isDeskbirdAdmin from the group claim. The parsed data is attached to request.userTokenData. Exports CurrentUserTokenData param decorator that reads it back in controller methods.',
+          },
+          {
+            type: 'pattern', icon: '👤', title: 'RequireUser',
+            body: 'Reads request.userTokenData (set by RequireFirebaseToken), calls UsersClient.findOne({ id: firebaseId }) to fetch the full user record from the Users service, and attaches it as request.user. Must run after RequireFirebaseToken. Exports CurrentUser param decorator. The separation exists because many endpoints only need the token (no DB hit) while others need the full user object.',
+          },
+          {
+            type: 'pattern', icon: '🔐', title: 'RequireUserRole and RequireFeatures',
+            body: 'Both use the mixin() pattern to create parameterised guard classes. RequireUserRole({ oneOf: ["admin"] }) creates a distinct injectable class with the role list baked in. RequireFeatures is a higher-order function: RequireFeatures(contextProvider)("all", "PUBLIC_API") — the contextProvider is passed at the call site so the guard knows which company/user to check features for. mixin() is required because NestJS DI treats each class as a unique injectable; without it, two calls with different params would resolve to the same instance.',
+          },
+          {
+            type: 'tip', icon: '🔗', title: 'How guards compose in practice',
+            body: '@UseGuards(RequireFirebaseToken, RequireUser, RequireUserRole({ oneOf: ["admin"] })) — they run left to right. Each guard trusts that the previous one already ran. RequireUserRole does not re-verify the token; it just reads request.user.role. If you apply RequireUserRole without RequireUser, it throws a developer error at runtime ("Did you forget RequireUser?") rather than silently passing.',
+          },
+        ],
+      },
+      {
+        title: '@deskbird/errors-nestjs',
+        description: 'Defines the error class and exception filter used by every service. Consuming a service imports DeskbirdErrorModule.forRoot() which registers DeskbirdExceptionFilter as a global APP_FILTER.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🏛️', title: 'DeskbirdHttpException — plain Error, not HttpException',
+            body: 'Extends Error directly, not NestJS HttpException. It carries status (number), errorCode (string), message, optional cause, and optional details. Domain code throws it without knowing about HTTP — the filter decides the response shape. This keeps services transport-agnostic: the same exception can be thrown in an HTTP handler or a Pub/Sub handler.',
+          },
+          {
+            type: 'insight', icon: '🔧', title: 'DeskbirdExceptionFilter extends BaseExceptionFilter',
+            body: 'Extends BaseExceptionFilter instead of implementing ExceptionFilter from scratch. This lets the filter intercept, reformat the exception as a new HttpException with the deskbird shape { statusCode, errorCode, message, details }, and then call super.catch() to delegate the actual HTTP response writing to NestJS. It also handles NestJS built-ins: 400 BadRequest extracts the validation error array from body.message; 404 and 429 are normalized to deskbird error codes.',
+          },
+        ],
+      },
+      {
+        title: '@deskbird/service-clients',
+        description: 'The largest lib — contains the abstract ServiceClient base class and one concrete client class per internal service (BookingsClient, UsersClient, OfficesClient, ResourcesClient, IamClient, FeatureManagerClient, and ~15 more).',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔌', title: 'ServiceClient base class',
+            body: 'Abstract class that creates and configures an AxiosInstance. Subclasses call super(options) in their constructor and get: automatic auth header injection (via headerFactories.authorization factory), correlation-id and traceparent propagation (via headerFactories), axios-retry with exponential backoff, and response error normalization into typed ServiceError. Subclasses only implement typed methods like findOne(), findMany(), create() on top of this.api.',
+          },
+          {
+            type: 'insight', icon: '📋', title: 'ServiceResult<T, ErrorCode> return type',
+            body: 'Client methods return ServiceResult<T, ErrorCode> = { success: true, data: T } | { success: false, error, errorCode }. The ErrorCode generic is a string literal union of expected error codes for that operation ("not_found" | "forbidden" | ...). Callers can use unwrapOrThrow() to throw on failure, or unwrapOrThrowMapped() to map specific error codes to different DeskbirdHttpExceptions before bubbling up.',
+          },
+          {
+            type: 'tip', icon: '✅', title: 'Zod response validation — strict in dev, lenient in prod',
+            body: 'Every client method calls this.parseData(SomeZodSchema, responseData). In non-production environments validation throws on schema mismatch — catches drift between services early in CI. In production it falls back to the raw data and reports the error via onParsingError (Sentry) without crashing. This gives strong guarantees in dev without risking a prod incident over an added field.',
+          },
+          {
+            type: 'pattern', icon: '💉', title: 'How services register clients',
+            body: 'SharedModule in public-api registers all client instances as providers, injecting ConfigService and TracingService. Each client provider uses useFactory: (cfg, tracing) => new BookingsClient({ baseUrl: cfg.get("DESKBIRD_API_BASE_URL"), headerFactories: { authorization: () => tokenProvider.getToken(audience), "correlation-id": () => tracing.getCorrelationId() } }). SharedModule exports them all so any feature module can inject BookingsClient directly.',
+          },
+        ],
+      },
+      {
+        title: '@deskbird/tracing-nestjs',
+        description: 'Two classes: TracingMiddleware for HTTP requests and TracingInterceptor for Pub/Sub message handlers. Both read tracing context from different places and store it in AsyncLocalStorage via TracingService.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔍', title: 'Middleware vs Interceptor — why both are needed',
+            body: 'HTTP requests carry traceparent in headers — middleware reads them before the request hits any guard or handler. Pub/Sub messages arrive via HTTP POST but their tracing context is inside req.body.message.attributes, not in HTTP headers. The interceptor detects the Pub/Sub shape (isPubSubMessageWithAttributes check) and overrides the tracing context from the message body. Without the interceptor, Pub/Sub handlers would create orphaned traces with no parent.',
+          },
+          {
+            type: 'insight', icon: '📡', title: 'AsyncLocalStorage — zero-overhead context propagation',
+            body: 'TracingService wraps Node.js AsyncLocalStorage. runWithTracingInformation() sets correlationId and traceparent for the current async chain. Any code downstream — guards, services, ServiceClient request interceptors — can call tracingService.getCorrelationId() with no parameter threading. This is how a correlation ID set by TracingMiddleware on the inbound request ends up in the headers of every outgoing Axios call made during that request.',
+          },
+        ],
+      },
+      {
+        title: '@deskbird/pubsub-nestjs and @deskbird/rest-nestjs',
+        callouts: [
+          {
+            type: 'pattern', icon: '📨', title: '@deskbird/pubsub-nestjs — DeskbirdPubSubModule',
+            body: 'A thin wrapper around DeskbirdPubSubClient (from the non-NestJS @deskbird/pubsub package). DeskbirdPubSubModule.forRoot() registers the client as a global provider, injecting TracingService optionally — if tracing is wired up, the client automatically attaches correlation-id and traceparent as Pub/Sub message attributes. PubSubMessagePipe is a NestJS pipe that validates incoming Pub/Sub push webhook payloads with Zod before they reach the controller.',
+          },
+          {
+            type: 'pattern', icon: '🔒', title: '@deskbird/rest-nestjs — configureApp() and CORS',
+            body: 'Exports one function: configureApp(app). It registers fastify-helmet (security headers), adds an onRequest hook for X-Robots-Tag: noindex, and enables CORS with a regex allowlist for *.deskbird.app and *.deskbird.com plus any custom domains from the CUSTOM_DOMAINS env var. Every service calls this in its bootstrap function — guaranteeing the same security baseline without per-service configuration.',
+          },
+        ],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-public-api-deep-dive',
+    title: 'Public API — Deep Dive',
+    subtitle: 'Module structure, auth, SharedModule, controllers, service layer, API key management',
+    tag: { label: 'Public API', color: '#3fb950', bg: '#0d1f14' },
+    description: 'The public-api service is the external gateway for enterprise customers. It exposes a REST API secured by API keys, enforces feature flags, and orchestrates calls to 10+ internal services. This chapter walks through every layer — from how the app is composed in AppModule down to how individual service methods fan out to multiple downstream clients.',
+    sections: [
+      {
+        title: 'Module Composition',
+        description: 'AppModule wires together lib modules (auth, logging, tracing, errors) and feature modules (one per domain entity). SharedModule is the backbone — it instantiates all service client providers and registers the global rate-limiting guard.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🧩', title: 'AppModule: lib modules imported once, feature modules per domain',
+            body: 'DeskbirdAuthModule, DeskbirdLoggingModule, TracingModule, DeskbirdErrorModule, ServiceAccountTokenProviderModule are all imported once with forRootAsync — each reads config from ConfigService via a small local factory class. Feature modules (BookingsModule, KeysModule, UsersModule, etc.) are pure domain slices: they import SharedModule to get service clients, declare their own controllers and providers, and export nothing. The boundary is clean: SharedModule provides infrastructure, feature modules provide domain logic.',
+          },
+          {
+            type: 'insight', icon: '💉', title: 'Global ValidationPipe registered as APP_PIPE',
+            body: 'Instead of calling app.useGlobalPipes() in main.ts, ValidationPipe is registered as { provide: APP_PIPE, useFactory: () => new ValidationPipe({ transform: true }) } in AppModule.providers. The transform: true option makes NestJS coerce query string values ("?limit=10") to their declared TypeScript types (number) automatically. APP_PIPE guarantees it applies to all routes including those in lazy-loaded modules.',
+          },
+        ],
+        files: [{
+          filename: 'app.module.ts (annotated)',
+          lang: 'typescript',
+          code: `// app.module.ts — full wiring diagram
+@Module({
+  imports: [
+    ConfigModule.forRoot(),   // Zod schema, crashes on bad env at startup
+
+    SharedModule,             // ALL service clients + global rate limit guard (see below)
+
+    // Each lib module uses a local factory class to read its config from ConfigService.
+    // This avoids hardcoding config keys in AppModule — each factory knows its own needs.
+    DeskbirdAuthModule.forRootAsync({ useClass: DeskbirdAuthOptionsFactory }),
+    DeskbirdLoggingModule.forRootAsync({ useClass: DeskbirdLoggingOptionsFactory }),
+    TracingModule.forRoot(),
+    DeskbirdErrorModule.forRoot(),      // registers DeskbirdExceptionFilter as APP_FILTER
+    ServiceAccountTokenProviderModule.forRootAsync({ useClass: ServiceAccountTokenProviderModuleFactory }),
+
+    JwtModule.register({ global: true }),  // used by PublicApiTokenVerifier + TokenRateLimiterGuard
+
+    // Feature modules — each is an isolated domain slice
+    UsersModule, BookingsModule, OfficesModule, KeysModule,
+    GroupsModule, ResourcesModule, ImportModule, SchedulingModule,
+    RoomsModule, FloorsModule, ZonesModule,
+  ],
+  providers: [
+    { provide: APP_PIPE, useFactory: () => new ValidationPipe({ transform: true }) },
+  ],
+})
+export class AppModule {}
+
+// Local factory classes — each is @Injectable() and gets ConfigService from DI
+@Injectable()
+class DeskbirdAuthOptionsFactory {
+  constructor(private configService: ConfigService) {}
+  create(): MinimalDeskbirdAuthModuleOptions {
+    return { gcpProjectId: this.configService.get('GCP_PROJECT_ID') };
+  }
+}
+
+@Injectable()
+class ServiceAccountTokenProviderModuleFactory {
+  constructor(private configService: ConfigService) {}
+  create() {
+    return {
+      // All audiences this service ever calls — SA token provider pre-fetches tokens for these
+      audiences: [
+        this.configService.get('DESKBIRD_API_BASE_URL'),
+        \`internal.\${this.configService.get('GCP_PROJECT_ID')}\`,
+        this.configService.get('FEATURE_MANAGER_BASE_URL'),
+        this.configService.get('IAM_SERVICE_URL'),
+        this.configService.get('GENERIC_BOOKINGS_SERVICE_URL'),
+      ],
+      fakeSaTokens: this.configService.get('FAKE_SERVICE_ACCOUNT_TOKENS'), // true in local dev
+    };
+  }
+}`,
+        }],
+      },
+      {
+        title: 'SharedModule — Service Client Factory Pattern',
+        description: 'SharedModule is the most complex module in the app. It registers every service client as a provider using a factory pattern that avoids duplicating the auth/tracing header setup for each client.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🏭', title: 'SERVICE_CLIENT_OPTIONS_FACTORY_TOKEN — shared factory',
+            body: 'Instead of repeating the headerFactories config for each of the 12 clients, SharedModule registers one factory provider under a Symbol token. This factory is a closure: (audience: string) => ServiceClientOptions. Each client provider then calls serviceClientOptionsFactory(audience) to get its options, passing only the specific audience URL it needs. The auth header, tracing headers, and onParsingError callback are shared — defined once.',
+          },
+          {
+            type: 'insight', icon: '🔑', title: 'Service account token per audience',
+            body: 'serviceAccountTokenProvider.getToken(audience) fetches a GCP Service Account token scoped to a specific audience (the target service URL). Each internal service validates that the token audience matches its own URL — this prevents a token issued to call the bookings service from being used to call the IAM service. The token provider caches tokens and refreshes them before expiry.',
+          },
+          {
+            type: 'critical', icon: '⚠️', title: 'Global rate limit guard registered in SharedModule',
+            body: 'SharedModule registers { provide: APP_GUARD, useClass: TokenRateLimiterGuard } — making it a global guard that runs on every request without needing @UseGuards() on each controller. This is intentional: rate limiting must be impossible to forget on new controllers. TokenRateLimiterGuard uses Redis (via the RedisModule also imported in SharedModule) with per-token buckets.',
+          },
+        ],
+        files: [{
+          filename: 'shared.module.ts (annotated)',
+          lang: 'typescript',
+          code: `// shared.module.ts — central service client wiring
+const SERVICE_CLIENT_OPTIONS_FACTORY_TOKEN = Symbol.for('ServiceClientOptions');
+
+// One provider that builds the reusable options factory closure
+{
+  provide: SERVICE_CLIENT_OPTIONS_FACTORY_TOKEN,
+  useFactory: (tracingService, serviceAccountTokenProvider, logger) => {
+    // Returns a FUNCTION — not an object — so each client calls it with its own audience
+    return (audience: string) => ({
+      headerFactories: {
+        authorization: async () =>
+          \`Bearer \${await serviceAccountTokenProvider.getToken(audience)}\`,
+        [TRACEPARENT_KEY]:   () => tracingService.getTraceparent(),
+        [CORRELATION_ID_KEY]: () => tracingService.getCorrelationId(),
+      },
+      onParsingError: (error) => logger.warn('failure in response parsing', { error }),
+    });
+  },
+  inject: [TracingService, ServiceAccountTokenProvider, DeskbirdLoggerService],
+},
+
+// Each client provider calls the factory with its own audience URL
+{
+  provide: BookingsClient,
+  useFactory: (factory, config) => new BookingsClient({
+    deskbirdApiBaseUrl: config.get('DESKBIRD_API_BASE_URL'),
+    ...factory(config.get('DESKBIRD_AUDIENCE')),  // audience = deskbird-api.<projectId>
+  }),
+  inject: [SERVICE_CLIENT_OPTIONS_FACTORY_TOKEN, ConfigService],
+},
+{
+  provide: IamClient,
+  useFactory: (factory, config) => new IamClient({
+    iamServiceBaseUrl: config.get('IAM_SERVICE_URL'),
+    ...factory(config.get('IAM_SERVICE_URL')),  // audience = IAM service URL itself
+  }),
+  inject: [SERVICE_CLIENT_OPTIONS_FACTORY_TOKEN, ConfigService],
+},
+// ... 10 more client providers, all following the same pattern
+
+// Global guard — applied to EVERY route, no @UseGuards() needed
+{ provide: APP_GUARD, useClass: TokenRateLimiterGuard },
+
+@Module({
+  imports: [ConfigModule, RedisModule, RateLimiterModule.registerAsync({ useClass: DeskbirdRateLimitingOptionsFactory })],
+  providers: [...providers, { provide: APP_GUARD, useClass: TokenRateLimiterGuard }],
+  exports: providers,  // all clients exported so feature modules can inject them
+})
+export class SharedModule {}`,
+        }],
+      },
+      {
+        title: 'API Key Authentication',
+        description: 'Public API consumers authenticate with API keys, not Firebase JWTs. The auth flow involves two token formats (legacy and IAM), Zod schema union parsing, and an IAM service call to verify the service account is still active.',
+        callouts: [
+          {
+            type: 'insight', icon: '🔑', title: 'Two token formats — legacy and IAM — parsed with Zod union',
+            body: 'The public API went through a migration: older integrations use legacy tokens (HMAC-signed, payload has keyId), newer ones use IAM service tokens (RSA-signed, payload has sub + iss: "deskbird-iam"). PublicApiTokenSchema is a Zod union: legacyTokenPayloadSchema.or(iamServiceTokenPayloadSchema). Zod tries the first schema, falls through to the second on failure. Both schemas add a payloadType discriminant via .transform() so downstream code can switch on it.',
+          },
+          {
+            type: 'pattern', icon: '🛡️', title: 'RequirePublicApiToken — three steps in canActivate',
+            body: '1) PublicApiTokenVerifier.verifyToken() extracts the token from Authorization header, decodes the payload without verifying (to read payloadType), then verifies the signature with the correct key (HMAC secret for legacy, RSA public key for IAM). 2) IamClient.serviceAccounts.verify() checks the service account is active and of type "publicApi" — prevents deleted/suspended keys from working even if the JWT is still valid. 3) Attaches { id, companyId, companyUuid, createdBy } as request.publicApiUser.',
+          },
+          {
+            type: 'tip', icon: '🏗️', title: 'PublicApiTokenVerifier is a plain @Injectable() — not a guard itself',
+            body: 'Verification logic lives in PublicApiTokenVerifier so it can be tested independently and reused in multiple guards. The actual guard (RequirePublicApiToken) injects it and calls verifyToken(). This separation follows the single responsibility principle: the verifier knows how to verify a token, the guard knows what to do after verification (attach user to request, call IAM).',
+          },
+        ],
+        files: [{
+          filename: 'token auth flow',
+          lang: 'typescript',
+          code: `// shared/guards/types.ts — two token schemas unified with Zod
+const legacyTokenPayloadSchema = z.object({
+  companyId: z.string(),
+  keyId:     z.string().uuid(),  // service account ID in the old system
+  iat:       z.number().int().positive(),
+}).transform(data => ({ ...data, payloadType: 'legacy' as const }));
+
+const iamServiceTokenPayloadSchema = z.object({
+  type:        z.literal('service_account_key'),
+  sub:         z.string().uuid(),  // service account ID in the IAM system
+  iss:         z.literal('deskbird-iam'),
+  iat:         z.number().int().positive(),
+  companyUuid: z.string().uuid(),
+}).transform(data => ({ ...data, payloadType: 'iam' as const }));
+
+// Zod tries legacyTokenPayloadSchema first; if it fails, tries iamServiceTokenPayloadSchema
+export const PublicApiTokenSchema = legacyTokenPayloadSchema.or(iamServiceTokenPayloadSchema);
+export type PublicApiTokenPayload = z.infer<typeof PublicApiTokenSchema>;
+
+// shared/guards/publicApiTokenVerifier.ts
+@Injectable()
+export class PublicApiTokenVerifier {
+  constructor(
+    private jwtService: JwtService,
+    configService: ConfigService,
+  ) {
+    this.jwtSecret = configService.get('PUBLIC_API_KEY_GENERATION_SECRET');  // for legacy
+    this.iamSigningKeyPublicKey = configService.get('IAM_SIGNING_KEY_PUBLIC_KEY');  // for IAM
+  }
+
+  async verifyToken(context: ExecutionContext): Promise<PublicApiTokenPayload> {
+    const request = context.switchToHttp().getRequest<FastifyRequest>();
+    const token = extractTokenFromRequest(request);  // throws DeskbirdTokenRequiredError if missing
+
+    // Decode WITHOUT verifying first — need payloadType to know which key to use
+    const payload = parseTokenPayload(token);  // Zod union parse, throws on invalid shape
+
+    const verificationOptions = payload.payloadType === 'legacy'
+      ? { secret: this.jwtSecret }            // HMAC
+      : { publicKey: this.iamSigningKeyPublicKey };  // RSA
+
+    const validation = await safeAwait(this.jwtService.verifyAsync(token, verificationOptions));
+    if (validation.isError) throw DeskbirdInvalidApiKeyTokenError;
+
+    return payload;
+  }
+}
+
+// shared/guards/requirePublicApiToken.guard.ts
+@Injectable()
+export class RequirePublicApiToken implements CanActivate {
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const token = await this.tokenVerifier.verifyToken(context);
+
+    // Step 2: verify the service account is still active in IAM
+    const result = await this.iamClient.serviceAccounts.verify(
+      token.payloadType === 'iam' ? token.sub : token.keyId,
+      'publicApi',
+    );
+    if (!result.success || !result.data.verified) throw DeskbirdInvalidApiKeyTokenError;
+
+    const serviceAccount = result.data.serviceAccount;
+
+    // Step 3: attach public API user to request
+    const request = context.switchToHttp().getRequest<FastifyRequest>();
+    (request as PublicApiRequest).publicApiUser = {
+      id:         serviceAccount.id,
+      companyId:  serviceAccount.companyId,
+      companyUuid: token.payloadType === 'iam'
+        ? token.companyUuid                          // already in IAM token payload
+        : serviceAccount.claims?.companyUuid,        // legacy: read from SA claims
+      createdBy: serviceAccount.createdBy,
+    };
+    return true;
+  }
+}`,
+        }],
+      },
+      {
+        title: 'Feature Flag Wiring',
+        description: 'The public-api wraps the generic RequireFeatures from @deskbird/guards-nestjs with a local context provider that knows how to extract companyUuid from either a public API token or a Firebase JWT.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🚦', title: 'featureAccessContextProvider — the glue between guard and request',
+            body: 'RequireFeatures from the guards lib needs a context provider function to know which company to check features for. The public-api provides featureAccessContextProvider which reads companyUuid from request.publicApiUser (public API routes) or request.userTokenData (Firebase JWT routes). This dual-source lookup means the same RequireFeatures wrapper works for both auth flows — the guard does not know or care which auth mechanism was used.',
+          },
+          {
+            type: 'insight', icon: '🔠', title: 'Feature type safety with a local Feature union',
+            body: 'The public-api defines type Feature = "PUBLIC_API" | "RESOURCE_BOOKING_PUBLIC_API" | "SCIM" | "WORKFORCE_PUBLIC_API". The local RequireFeatures wrapper accepts ...features: Feature[] — so passing an unknown feature string is a compile-time error. The base lib uses string[], which is more flexible but less safe. The public-api tightens the type to its own known feature set.',
+          },
+        ],
+        files: [{
+          filename: 'shared/guards/requireFeatures.guard.ts',
+          lang: 'typescript',
+          code: `// shared/guards/requireFeatures.guard.ts
+// Typed feature enum — only features relevant to the public-api
+type Feature = 'PUBLIC_API' | 'RESOURCE_BOOKING_PUBLIC_API' | 'SCIM' | 'WORKFORCE_PUBLIC_API';
+
+// Context provider: reads companyUuid from whichever auth mechanism was used
+export const featureAccessContextProvider = async (context: ExecutionContext) => {
+  const request = context.switchToHttp().getRequest();
+
+  // publicApiUser is set by RequirePublicApiToken
+  // userTokenData is set by RequireFirebaseToken
+  // This guard works after either one
+  const companyUuid = (request.publicApiUser ?? request.userTokenData)?.companyUuid;
+
+  if (!companyUuid)
+    throw new DeskbirdHttpException(401, 'tokenRequired', 'Resource access requires bearer token');
+
+  return { companyUuid };
+};
+
+// Local wrappers — pre-bind the context provider and enforce the Feature type
+export const RequireFeatures = (...features: Feature[]) =>
+  _RequireFeatures(featureAccessContextProvider)('all', ...features);
+
+export const RequireAnyFeatures = (...features: Feature[]) =>
+  _RequireFeatures(featureAccessContextProvider)('any', ...features);
+
+// Usage on a controller:
+@UseGuards(RequirePublicApiToken, RequireFeatures('PUBLIC_API', 'RESOURCE_BOOKING_PUBLIC_API'))
+export class BookingsController { ... }
+
+// RequireAnyFeatures on the keys controller (either PUBLIC_API or SCIM is enough):
+@UseGuards(RequireFirebaseToken, RequireUser, RequireUserRole({ oneOf: ['admin'] }), RequireAnyFeatures('PUBLIC_API', 'SCIM'))
+export class ApiKeyController { ... }`,
+        }],
+      },
+      {
+        title: 'Controller Patterns',
+        description: 'Controllers in the public-api follow a consistent pattern: Swagger decorators, guard chain, typed param decorators, and thin handler methods that delegate immediately to a service.',
+        callouts: [
+          {
+            type: 'pattern', icon: '📄', title: 'Swagger decorators as reusable composites',
+            body: '@ListBookingsResponse, @ForbiddenResponse, @UnauthorizedResponse are custom decorators defined in swagger/bookings.responses.ts. Each applies a bundle of @ApiResponse() decorators. Reusing these composites across endpoints ensures consistent Swagger docs and avoids repeating the same @ApiResponse(status: 401, ...) on every method. The @ApiOperation({ summary, description }) is unique per endpoint and lives directly on the method.',
+          },
+          {
+            type: 'insight', icon: '🔀', title: 'Dual path prefix — backward compatibility without duplication',
+            body: '@Controller([LEGACY_PATH_PREFIX + "/bookings", "/bookings"]) maps two paths to one controller. New clients use /bookings, old integrations keep working via /v1/bookings. The Swagger spec filters out LEGACY_PATH_PREFIX paths at startup so new customers only see the canonical routes in the docs. There is no code duplication — both paths hit the same handler methods.',
+          },
+          {
+            type: 'tip', icon: '🧩', title: 'createParamDecorator for CurrentApiTokenCreatedById',
+            body: 'CurrentApiTokenCreatedById is defined inline in bookings.controller.ts with createParamDecorator. It reads the createdBy field from request.publicApiUser (which is the Firebase UID of the user who generated the API key). This is used as the actor when creating/cancelling bookings — so the audit trail records who made the change, not just which company. If createdBy is missing, it throws 401 immediately.',
+          },
+          {
+            type: 'pattern', icon: '📦', title: 'Feature module structure: controller → service, imports SharedModule',
+            body: 'BookingsModule imports SharedModule (to get BookingsClient, UsersClient, etc.), declares BookingsController, and provides GetBookingsService + BookingActionsService. The two services are split by read vs write: GetBookingsService handles all read queries, BookingActionsService handles mutations. This keeps each class focused and makes testing easier — GetBookingsService tests never need to mock write operations.',
+          },
+        ],
+        files: [{
+          filename: 'controller structure (annotated)',
+          lang: 'typescript',
+          code: `// features/bookings/bookings.module.ts
+@Module({
+  imports: [SharedModule],  // gets BookingsClient, UsersClient, GuestsClient, ResourcesClient, OfficesClient
+  controllers: [BookingsController],
+  providers: [GetBookingsService, BookingActionsService],
+  // No exports — this module is a leaf, nothing needs its providers
+})
+export class BookingsModule {}
+
+// features/bookings/apis/rest/controllers/bookings.controller.ts
+@ApiTags('Bookings')                    // groups all endpoints under "Bookings" in Swagger UI
+@ApiKeyAuthorizationHeader              // custom composite: adds auth header to every endpoint in Swagger
+@Controller([LEGACY_PATH_PREFIX + '/bookings', '/bookings'])
+@UseGuards(
+  RequirePublicApiToken,               // verifies API key JWT + calls IAM to confirm active SA
+  RequireFeatures('PUBLIC_API', 'RESOURCE_BOOKING_PUBLIC_API'),  // both flags required
+)
+export class BookingsController {
+  // Inline param decorator — reads from request.publicApiUser.createdBy
+  // Defined in the controller file, not exported, because it is only used here
+  private readonly CurrentApiTokenCreatedById = createParamDecorator((_, ctx: ExecutionContext): string => {
+    const request = ctx.switchToHttp().getRequest<FastifyRequest>();
+    const userData = getPublicApiUserData(request);
+    if (!userData.createdBy)
+      throw new DeskbirdHttpException(401, 'UNAUTHORIZED', 'Invalid Token');
+    return userData.createdBy;
+  });
+
+  @ApiOperation({ summary: 'Lists company bookings', description: '...' })
+  @ForbiddenResponse     // @ApiResponse(403)
+  @UnauthorizedResponse  // @ApiResponse(401)
+  @ListBookingsResponse  // @ApiResponse(200, schema: PaginatedBookingResponse)
+  @Get()
+  async getBookings(
+    @Query() query: GetBookingsQuery,              // class-validator + transform: coerces types
+    @CurrentPublicApiUser() { companyUuid }: PublicApiUser,  // from request.publicApiUser
+  ): Promise<PaginatedBookingResponse> {
+    // Controller is a thin delegation layer — no business logic here
+    return this.getBookingsService.getBookings({ companyId: companyUuid, ...query });
+  }
+
+  @Post()
+  @HttpCode(200)  // explicit: POST that creates returns 200, not 201 (API design choice)
+  async createBooking(
+    @Body() dto: CreateBookingDto,
+    @CurrentApiTokenCreatedById() createdBy: string,
+    @CurrentPublicApiUser() { companyId }: PublicApiUser,
+  ): Promise<BookingResponse> {
+    const [result] = await this.bookingActions.createBookings({ ... });
+    // Handle per-booking failure: createBookings returns discriminated union array
+    if (!result.success)
+      throw new DeskbirdHttpException(result.error.statusCode, result.error.errorCode, result.error.message);
+    return result.booking;
+  }
+
+  @Patch('/:bookingId/cancel')
+  @HttpCode(204)  // 204 No Content — mutation succeeded, nothing to return
+  async cancel(
+    @Param(ValidationPipe) { bookingId }: GetSingleBookingQuery,
+    @CurrentApiTokenCreatedById() createdBy: string,
+  ): Promise<void> {
+    await this.bookingActions.cancelBooking(bookingId, createdBy);
+  }
+}`,
+        }],
+      },
+      {
+        title: 'Service Layer — Fan-out and Data Assembly',
+        description: 'The service layer does the heavy lifting: parallel fan-out to multiple internal services, chunked requests for large ID sets, and company membership assertions before returning data.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔀', title: 'Promise.all fan-out — one bulk fetch per service',
+            body: 'After fetching bookings, GetBookingsService collects all unique guestIds, userIds, resourceIds, officeIds from the result set, then calls four services in parallel via Promise.all(). The results are assembled into Maps keyed by ID, then a mapper function creates the final response objects. This pattern avoids N+1 calls (one per booking) while keeping the code readable — all fetching is declarative and parallel.',
+          },
+          {
+            type: 'insight', icon: '📦', title: 'chunk() for large resource ID sets',
+            body: 'getResources() uses lodash chunk() to split resource IDs into batches of 500 before calling the resources service. This handles the case where a company has hundreds of bookings in a single page — without chunking, the resources service URL query string would exceed the maximum URL length. The chunks are fetched in parallel via Promise.all(), then flatMapped into one array.',
+          },
+          {
+            type: 'critical', icon: '🔐', title: 'assertCompanyMembership — cross-tenant data isolation',
+            body: 'getBooking() (single booking by ID) calls assertCompanyMembership(companyId, booking) after fetching the booking. This checks that booking.companyId matches the authenticated API token\'s companyId. Without this check, a company with a valid API key could fetch any other company\'s bookings by guessing booking IDs. The assertion is a dedicated util function so it can be reused across services.',
+          },
+          {
+            type: 'pattern', icon: '📝', title: 'GetBookingsService vs BookingActionsService — read/write split',
+            body: 'Reads live in GetBookingsService, mutations in BookingActionsService. Both inject the same set of service clients from SharedModule. The split makes each class smaller and more focused — GetBookingsService only needs to understand how to assemble read responses, BookingActionsService only needs to understand how to map mutation errors to HTTP exceptions. Tests for each class are independently scoped.',
+          },
+        ],
+        files: [{
+          filename: 'service layer patterns',
+          lang: 'typescript',
+          code: `// GetBookingsService — read side
+@Injectable()
+export class GetBookingsService {
+  async getBookings({ companyId, ...query }): Promise<PaginatedResponse<BookingModel>> {
+    const response = await this.bookingsClient.findMany({ companyId, ...query });
+    const { data: bookings, ...pagination } = unwrapOrThrow(response);
+
+    // Collect all unique IDs from the result set — one bulk fetch per service
+    const guestIds    = uniq(compact(bookings.map(b => b.guestId)));
+    const userIds     = uniq(compact(bookings.map(b => b.userId)));
+    const resourceIds = uniq(compact(bookings.map(b => b.resourceId)));
+    const officeIds   = uniq(compact(bookings.map(b => b.officeId)));
+
+    // All four fetches run in parallel
+    const [guests, users, resources, offices] = await Promise.all([
+      this.getGuests(guestIds),
+      this.getUsers(userIds),
+      this.getResources(resourceIds),  // chunked internally for large sets
+      this.getOffices(companyId, officeIds),
+    ]);
+
+    // Maps for O(1) lookup during mapping
+    const guestsMap    = new Map(guests.map(g    => [g.id, g]));
+    const usersMap     = new Map(users.map(u     => [u.id, u]));
+    const resourcesMap = new Map(resources.map(r => [r.id, r]));
+    const officesMap   = new Map(offices.map(o   => [o.id, o]));
+
+    return { ...pagination, data: bookings.map(bookingMapper(guestsMap, usersMap, resourcesMap, officesMap)) };
+  }
+
+  async getBooking({ bookingId, companyId }) {
+    const booking = unwrapOrThrowMapped(
+      await this.bookingsClient.findOne({ id: bookingId }),
+      () => DeskbirdNotFoundException,
+    );
+    if (!booking) throw DeskbirdNotFoundException;
+
+    // Cross-tenant isolation check — must run before returning any data
+    assertCompanyMembership(companyId, booking);
+
+    const [user, [guest], [resource], [office]] = await Promise.all([...]);
+    return mapBooking(booking, user, guest, resource!, office!);
+  }
+
+  private async getResources(resourceIds: string[]): Promise<Resource[]> {
+    if (!resourceIds.length) return [];
+    // Split into 500-ID chunks to avoid URL length limits
+    const chunks = chunk(uniq(resourceIds), 500);
+    const results = await Promise.all(
+      chunks.map(ids => this.resourcesClient.findMany({ ids }).then(unwrapOrThrow))
+    );
+    return results.flatMap(({ data }) => data);
+  }
+}`,
+        }],
+      },
+      {
+        title: 'API Key Management',
+        description: 'The /keys endpoint lets company admins create and manage API keys. Under the hood, each API key is backed by a GCP Service Account in the IAM service — creating a key creates a service account, deleting a key deletes the service account.',
+        callouts: [
+          {
+            type: 'pattern', icon: '🔑', title: 'API key = IAM Service Account + key',
+            body: 'ApiKeyService.createNewApiKey() calls iamClient.serviceAccounts.create() to create a service account with claims: { companyUuid } (and provider for SCIM keys). Then calls iamClient.serviceAccounts.createKey() to get the actual JWT token string. There is a 1:1 relationship between service account and API key — deleting a key deletes the service account. This means all validation (is the key active? what company is it for?) is delegated to the IAM service.',
+          },
+          {
+            type: 'insight', icon: '⏰', title: 'API key expiration — 1 year default for publicApi type',
+            body: 'publicApi keys get a 1-year expiration by default (configurable via expirationInYears). SCIM keys do not expire. The expiresAt is passed to iamClient.serviceAccounts.createKey() — the IAM service enforces it when verifying. The public-api does not track expiration itself; it relies entirely on IAM\'s verify() call in RequirePublicApiToken.',
+          },
+          {
+            type: 'tip', icon: '🧹', title: 'Rollback on partial failure',
+            body: 'If serviceAccounts.create() succeeds but serviceAccounts.createKey() fails, ApiKeyService deletes the just-created service account before throwing. Without this cleanup, orphaned service accounts would accumulate in IAM. This manual rollback is necessary because there is no distributed transaction across two service calls.',
+          },
+          {
+            type: 'pattern', icon: '🔐', title: 'ApiKeyController guard chain',
+            body: '@UseGuards(RequireFirebaseToken, RequireUser, RequireUserRole({ oneOf: ["admin"], allowDeskbirdAdmins: true }), RequireAnyFeatures("PUBLIC_API", "SCIM")) — four guards in order. Firebase JWT must be valid, user must exist in the DB, user must be an admin (or a deskbird internal employee), and the company must have at least one of the API features enabled. Only admins can create/delete API keys — employees cannot.',
+          },
+        ],
+        files: [{
+          filename: 'apiKey.service.ts + apiKey.controller.ts',
+          lang: 'typescript',
+          code: `// features/keys/domain/services/apiKey.service.ts
+@Injectable()
+export class ApiKeyService {
+  async createNewApiKey(inputModel: CreateApiKeyModel, { userId, userUuid, companyId, companyUuid }) {
+    const { serviceAccountId, apiKey, expiresAt } = await this.createServiceAccountWithKey({
+      ...inputModel, companyUuid, userUuid,
+    });
+    return { ...inputModel, id: serviceAccountId, apiKey, companyId, companyUuid, status: 'active', expiresAt, createdAt: new Date(), createdBy: userId };
+  }
+
+  private async createServiceAccountWithKey(input) {
+    const expiresAt = input.type === 'publicApi'
+      ? new Date(Date.now() + ONE_YEAR_MS * Math.max(1, input.expirationInYears ?? 1))
+      : undefined;  // SCIM keys do not expire
+
+    const claims = input.type === 'scim'
+      ? { companyUuid: input.companyUuid, provider: input.provider }
+      : { companyUuid: input.companyUuid };
+
+    // Step 1: create the service account in IAM
+    const { id: serviceAccountId } = unwrapOrThrowMapped(
+      await this.iamClient.serviceAccounts.create({ type: input.type, companyUuid: input.companyUuid, claims, createdByUserUuid: input.userUuid }),
+      error => DeskbirdPreconditionFailedError(error, 'Service account creation failed.'),
+    );
+
+    // Step 2: generate the JWT key for this service account
+    const keyResult = await this.iamClient.serviceAccounts.createKey({ serviceAccountId, expiresAt: expiresAt ?? null });
+
+    if (!keyResult.success) {
+      // Rollback: delete the orphaned service account before throwing
+      await this.iamClient.serviceAccounts.delete(serviceAccountId);
+      throw DeskbirdPreconditionFailedError(keyResult.errorCode ?? 'unknown', 'Service account key creation failed.');
+    }
+
+    return { serviceAccountId, apiKey: keyResult.data.key, expiresAt };
+  }
+
+  async deleteApiKey(serviceAccountId: string): Promise<void> {
+    // Deleting the service account invalidates the key — IAM verify() will fail
+    await this.iamClient.serviceAccounts.delete(serviceAccountId);
+  }
+}
+
+// features/keys/apis/rest/controllers/apiKey.controller.ts
+@Controller([LEGACY_PATH_PREFIX + '/keys', '/keys'])
+@UseGuards(
+  RequireFirebaseToken,
+  RequireUser,
+  RequireUserRole({ oneOf: ['admin'], allowDeskbirdAdmins: true }),
+  RequireAnyFeatures('PUBLIC_API', 'SCIM'),
+)
+export class ApiKeyController {
+  @Post()
+  @HttpCode(201)
+  async newApiKey(
+    @Body() body: CreateApiKeyInputModel,
+    @CurrentUserTokenData() { companyId, companyUuid, userId, userUuid }: UserTokenData,
+  ) {
+    // Check the specific feature flag for this key type before creating
+    const feature = body.type === 'publicApi' ? 'PUBLIC_API' : 'SCIM';
+    const access = await this.featureManagerClient.getFeatureAccess({ companyUuid });
+    if (!access.success || !access.data.features.includes(feature))
+      throw new DeskbirdHttpException(403, 'featureNotAllowed', 'Feature not allowed');
+
+    return this.apiKeyService.createNewApiKey(
+      CreateApiKeyInputModel.toCreateApiKeyModel(body),
+      { companyId, companyUuid, userId, userUuid },
+    );
+  }
+
+  @Delete(':id')
+  @HttpCode(204)
+  async deleteApiKey(@Param('id', new ParseUUIDPipe()) id: string) {
+    return this.apiKeyService.deleteApiKey(id);
+  }
+}`,
+        }],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-overview',
+    title: 'deskbird — Real-World NestJS',
+    subtitle: 'Desk booking SaaS: architecture, tech stack, and design decisions',
+    tag: { label: 'deskbird', color: '#58a6ff', bg: '#0d1f33' },
+    description: 'deskbird is a desk booking SaaS used by hundreds of enterprise companies. The public-api service is a NestJS 10 application using Fastify, Firebase Auth, GCP Pub/Sub, Redis, and a suite of shared internal libraries. This walkthrough covers exactly how NestJS is used in a real production codebase — from bootstrap to guards to inter-service communication.',
+    sections: [
+      {
+        title: 'What is deskbird?',
+        description: 'deskbird lets employees book desks, parking spots, and meeting rooms. It exposes a Public API (OAuth2-style API keys) used by enterprise customers to integrate with their HR/IT systems — think creating bookings from Slack, syncing with Microsoft Teams, or bulk-importing users from SCIM.',
+        callouts: [
+          { type: 'insight', icon: '🏢', title: 'Architecture: many small NestJS services', body: 'deskbird uses a microservices architecture on GCP Cloud Run. The public-api service is the external gateway — it validates API keys, enforces feature flags, and proxies to internal services (bookings, users, offices, resources) via HTTP. Internal services communicate via service account JWT tokens, not user tokens.' },
+          { type: 'pattern', icon: '📦', title: 'Shared library monorepo', body: 'deskbird-libs is an npm workspaces monorepo of internal libraries: @deskbird/auth-nestjs, @deskbird/guards-nestjs, @deskbird/errors-nestjs, @deskbird/service-clients, @deskbird/tracing-nestjs, @deskbird/pubsub-nestjs. Every NestJS service installs these instead of duplicating auth/tracing/error code. Changes to a lib are published and bumped across all services.' },
+          { type: 'tip', icon: '⚡', title: 'Why Fastify instead of Express?', body: 'Fastify is 2× faster at raw HTTP throughput. On GCP Cloud Run (pay-per-CPU-second), it directly reduces costs at scale. Fastify also supports HTTP/2 natively — the public-api enables HTTP/2 on Cloud Run (isCloudExecution() check in bootstrap) to get multiplexed streams and header compression for free.' },
+        ],
+      },
+      {
+        title: 'Tech Stack',
+        callouts: [
+          { type: 'pattern', icon: '🛠️', title: 'Stack overview', body: 'NestJS 10 + Fastify adapter · Firebase Authentication (RS256 JWT) · GCP Pub/Sub (async events) · Redis (rate limiting, session cache) · Zod (schema validation) · @nestjs/swagger (auto OpenAPI spec) · nestjs-rate-limiter · axios-retry · OpenTelemetry / GCP Cloud Trace' },
+        ],
+        files: [{ filename: 'app.ts + app.module.ts', lang: 'typescript', code: D.appBootstrap }],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-config',
+    title: 'Config & Bootstrap',
+    subtitle: 'Zod env validation, Fastify adapter, Helmet, Swagger, graceful shutdown',
+    tag: { label: 'Config', color: '#3fb950', bg: '#0d1f14' },
+    description: 'Configuration is validated with Zod at startup — if any required env var is missing or the wrong type, the process exits immediately with a human-readable error. The app uses NestFastifyApplication for HTTP/2 support on GCP Cloud Run and registers Helmet security headers via the shared configureApp() helper.',
+    sections: [
+      {
+        title: 'Zod Config Validation',
+        description: 'Unlike class-validator, Zod can coerce types (string → number), derive computed fields via .transform(), and produce detailed error messages listing every invalid field at once — not just the first failure.',
+        callouts: [
+          { type: 'insight', icon: '✅', title: 'Fail-fast at startup, not at runtime', body: 'Without config validation, missing REDIS_HOST causes a connection failure at the first request, not at startup. Zod validation means the pod crashes immediately on deploy with a clear error — catchable in your CI/CD pipeline before traffic reaches it.' },
+          { type: 'pattern', icon: '🔄', title: 'FAKE_SERVICE_ACCOUNT_TOKENS for local dev', body: 'In local development there is no GCP metadata server, so real service account tokens cannot be fetched. FAKE_SERVICE_ACCOUNT_TOKENS=true makes the ServiceAccountTokenProvider return a dummy token instead of calling GCP. This flag is validated as a boolean (Zod transforms "true"→true) and is never true in production.' },
+        ],
+        files: [{ filename: 'config.schema.ts', lang: 'typescript', code: D.configSchema }],
+      },
+      {
+        title: 'App Bootstrap & Security Middleware',
+        callouts: [
+          { type: 'tip', icon: '🔒', title: 'configureApp() is a shared library function', body: 'Every NestJS service in the deskbird monorepo calls configureApp() from @deskbird/rest-nestjs. This guarantees helmet headers and CORS are applied uniformly — a new service cannot accidentally forget them. Shared bootstrap helpers are a key advantage of a monorepo library architecture.' },
+          { type: 'insight', icon: '📄', title: 'OpenAPI spec written to disk at startup', body: 'SwaggerModule.createDocument() runs at startup and writes openapi-spec.json. The CI pipeline checks this file into git and diffs it on every PR. If an endpoint signature changes without a spec update, the diff makes it visible — preventing silent breaking changes to API consumers.' },
+        ],
+        files: [{ filename: 'configureApp.ts', lang: 'typescript', code: D.configureApp }],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-auth',
+    title: 'Firebase Auth Module',
+    subtitle: 'ConfigurableModuleBuilder, certificate caching, JWT verification',
+    tag: { label: 'Auth', color: '#a371f7', bg: '#1f1535' },
+    description: 'The @deskbird/auth-nestjs library wraps Firebase JWT verification. Firebase uses rotating X.509 certificates (not a static secret), so the library must fetch and cache Google\'s public certificates, respecting the Cache-Control max-age header. The module is built with ConfigurableModuleBuilder — the idiomatic NestJS pattern for publishable library modules that support both sync and async configuration.',
+    sections: [
+      {
+        title: 'ConfigurableModuleBuilder and Certificate Caching',
+        callouts: [
+          { type: 'pattern', icon: '🏗️', title: 'ConfigurableModuleBuilder generates forRoot/forRootAsync', body: 'setClassMethodName("forRoot").build() generates four exports: ConfigurableModuleClass (to extend), MODULE_OPTIONS_TOKEN (injection token for options), OPTIONS_TYPE and ASYNC_OPTIONS_TYPE (TypeScript types). The consuming module just extends ConfigurableModuleClass and gets forRoot() and forRootAsync() for free — no manual async factory boilerplate.' },
+          { type: 'insight', icon: '🔑', title: 'Two Firebase issuers supported', body: 'securetoken.google.com/<projectId> → tokens issued to end users (Firebase Auth SDK). accounts.google.com → Google service account tokens used for machine-to-machine calls. Each issuer has its own certificate URL at Google APIs. The CertificateProvider maintains a cache keyed by issuer, fetching both on startup.' },
+          { type: 'warning', icon: '⚠️', title: 'Numeric project ID from GCP metadata endpoint', body: 'Firebase requires the numeric GCP project ID (not the string project ID) to validate token audience. On GCP Cloud Run, if not set as env var, DeskbirdAuthModuleOptionsWithDefaultsFactory fetches it from the GCP metadata endpoint (http://metadata.google.internal) — this only works when running on GCP, hence the env var fallback for local dev.' },
+        ],
+        files: [
+          { filename: 'auth.module.ts + module-definition.ts', lang: 'typescript', code: D.authModule },
+          { filename: 'certificateProvider.ts + authVerifier.ts', lang: 'typescript', code: D.certificateProvider },
+        ],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-guards',
+    title: 'Guard Chain',
+    subtitle: 'RequireFirebaseToken → RequireUser → RequireUserRole → RequireFeatures',
+    tag: { label: 'Guards', color: '#f0883e', bg: '#271b0e' },
+    description: 'Authentication and authorization in deskbird use a four-layer guard chain applied via @UseGuards(). Each guard does one thing: verify the token, fetch the user, check the role, check the feature flag. The mixin() pattern enables parameterised guard instances — RequireUserRole({ oneOf: [\'admin\'] }) creates a new injectable class with the config baked in.',
+    sections: [
+      {
+        title: 'Guard Chain and the mixin() Pattern',
+        callouts: [
+          { type: 'pattern', icon: '🔗', title: 'Guards are a pipeline, not a single monolith', body: 'RequireFirebaseToken attaches tokenData to the request. RequireUser reads that tokenData, fetches the full user from Users service, and attaches it. RequireUserRole reads the user. This chain enables fine-grained reuse: some routes verify token only (no DB hit), some fetch the user, some also check features — apply only what\'s needed.' },
+          { type: 'insight', icon: '🧱', title: 'mixin() vs @SetMetadata() for parameterised guards', body: 'mixin() creates a new class per call — RequireUserRole({ oneOf: [\'admin\'] }) returns a distinct class from RequireUserRole({ oneOf: [\'employee\'] }). NestJS\'s DI treats them as separate injectables. This is cleaner than SetMetadata+Reflector because the config is type-checked at the call site, not at runtime.' },
+          { type: 'tip', icon: '👤', title: 'isDeskbirdAdmin bypass', body: 'Deskbird internal staff have isDeskbirdAdmin: true in their token (from a Firebase custom claim). RequireUserRole({ allowDeskbirdAdmins: true }) lets them bypass company role checks — enabling customer support to access any company\'s data. This flag is validated by Zod during token parsing, not trusted from raw JWT.' },
+        ],
+        files: [{ filename: 'guards chain', lang: 'typescript', code: D.guards }],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-service-clients',
+    title: 'Service Clients',
+    subtitle: 'Abstract ServiceClient, Axios interceptors, Zod validation, ServiceResult<T>',
+    tag: { label: 'Clients', color: '#79c0ff', bg: '#0d1f33' },
+    description: 'All inter-service HTTP calls in deskbird go through the @deskbird/service-clients library. An abstract ServiceClient base class provides: automatic auth header injection (service account tokens), correlation ID + traceparent propagation, Axios retry with exponential backoff, and Zod response validation. Each downstream service gets a concrete client class with typed methods.',
+    sections: [
+      {
+        title: 'Abstract ServiceClient Base Class',
+        callouts: [
+          { type: 'pattern', icon: '🔌', title: 'headerFactories: lazy async header injection', body: 'The authorization factory calls ServiceAccountTokenProvider.getToken(audience) on every request. The token provider caches the token and refreshes it before expiry — callers never manage token lifecycle. Similarly, correlationId and traceparent factories read from AsyncLocalStorage (TracingService) so they always reflect the current request\'s tracing context.' },
+          { type: 'insight', icon: '📋', title: 'ServiceResult<T, ErrorCode> — typed error handling', body: 'Instead of try/catch on every call, clients return { success: true, data } | { success: false, error, errorCode }. The errorCode is a string literal union (\'not_found\' | \'forbidden\' | ...) so callers can switch on it with type narrowing. unwrapOrThrow() throws if success is false; unwrapOrThrowMapped() lets you map specific error codes to different exceptions.' },
+          { type: 'tip', icon: '✅', title: 'Zod response validation off in prod', body: 'validateResponses is enabled in non-prod environments (GCP_PROJECT_ID !== "deskbird-bbe72" — the prod project). In prod, if a downstream service returns an unexpected field, it\'s ignored instead of throwing. Parsing errors are reported to Sentry via onParsingError for monitoring without causing prod incidents.' },
+        ],
+        files: [{ filename: 'serviceClient.class.ts', lang: 'typescript', code: D.serviceClient }],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-error-handling',
+    title: 'Error Handling',
+    subtitle: 'DeskbirdHttpException, BaseExceptionFilter, stable errorCode contract',
+    tag: { label: 'Errors', color: '#ff7b72', bg: '#2d1318' },
+    description: 'deskbird uses DeskbirdHttpException — a plain Error subclass, not NestJS HttpException — as its domain exception class. The DeskbirdExceptionFilter extends BaseExceptionFilter and normalises all exceptions into a consistent { statusCode, errorCode, message, details } shape. The errorCode string is the stable API contract; HTTP status codes can change, error codes cannot.',
+    sections: [
+      {
+        title: 'DeskbirdHttpException and DeskbirdExceptionFilter',
+        callouts: [
+          { type: 'insight', icon: '🏛️', title: 'Why not extend HttpException?', body: 'If domain code throws HttpException(409), it couples to HTTP. If it throws InsufficientFundsException (which extends Error, not HttpException), the domain stays transport-agnostic. The filter decides the HTTP status. The same exception class could be thrown in a Pub/Sub handler with no HTTP context.' },
+          { type: 'pattern', icon: '🔍', title: 'BaseExceptionFilter for response delegation', body: 'extends BaseExceptionFilter instead of implements ExceptionFilter lets us intercept, reformat the exception body, then call super.catch(new HttpException(newBody, status)) to delegate actual response writing to NestJS. This avoids re-implementing all the content negotiation logic.' },
+          { type: 'critical', icon: '⚠️', title: 'errorCode is a stable public contract', body: 'API clients switch on errorCode: "tokenExpired", "user_not_found", "forbidden". These strings are in their integration code and cannot change without a breaking change + migration period. HTTP status codes are secondary. Always add new error codes; never rename existing ones.' },
+        ],
+        files: [{ filename: 'error classes + filter', lang: 'typescript', code: D.errorHandling }],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-bookings',
+    title: 'Bookings API',
+    subtitle: 'Controller, service orchestration, feature gates, parallel fan-out',
+    tag: { label: 'Bookings', color: '#3fb950', bg: '#0d1f14' },
+    description: 'The BookingsController is the core of the public API — it handles CRUD operations on desk/parking/resource bookings. After creating bookings, BookingActionsService does a parallel fan-out to enrich the response: it fetches users, guests, resources, and offices from four different internal services concurrently via Promise.all().',
+    sections: [
+      {
+        title: 'Controller and Service Orchestration',
+        callouts: [
+          { type: 'pattern', icon: '🔀', title: 'Promise.all() fan-out for response enrichment', body: 'createBookings() first creates all bookings in one batch call, then fans out to 4 services in parallel: getGuests, getUsers, getResources, getOffices. The results are combined via Maps keyed by ID. This is the standard pattern for N+1 prevention in a microservices architecture — one bulk fetch per service, not one fetch per booking.' },
+          { type: 'insight', icon: '🔒', title: 'Feature flags as business gates, not kill-switches', body: 'RequireFeatures("PUBLIC_API", "RESOURCE_BOOKING_PUBLIC_API") means a company must have both flags enabled in FeatureManager to call this endpoint. This is not just a technical toggle — it is the upselling mechanism. Companies on the basic plan do not have PUBLIC_API, so they get 403 until they upgrade. No separate auth check needed.' },
+          { type: 'tip', icon: '📝', title: 'Dual path prefix for backwards compatibility', body: '@Controller([legacy_prefix + "/bookings", "/bookings"]) maps two URL paths to the same controller. The legacy path is kept for existing integrations that cannot migrate immediately. LEGACY_PATH_PREFIX routes are filtered out of the public Swagger spec so new customers see only the canonical path.' },
+        ],
+        files: [{ filename: 'bookings.controller.ts + bookingActions.service.ts', lang: 'typescript', code: D.bookingsController }],
+      },
+    ],
+  },
+
+  {
+    id: 'deskbird-tracing',
+    title: 'Tracing & Rate Limiting',
+    subtitle: 'TracingMiddleware, TracingInterceptor, token-based rate limiting with Redis',
+    tag: { label: 'Observability', color: '#79c0ff', bg: '#0d1f33' },
+    description: 'Distributed tracing in deskbird uses W3C traceparent headers propagated via AsyncLocalStorage. TracingMiddleware handles HTTP requests; TracingInterceptor handles Pub/Sub message payloads (where the tracing context is in message attributes, not HTTP headers). Rate limiting uses a custom guard that rate-limits per API token (not per IP) with SHA-256 hashed bucket keys in Redis.',
+    sections: [
+      {
+        title: 'Tracing Middleware + Interceptor',
+        callouts: [
+          { type: 'pattern', icon: '🔍', title: 'Middleware for HTTP, Interceptor for Pub/Sub', body: 'HTTP requests carry tracing context in headers — TracingMiddleware reads them before the request reaches any guard or handler. Pub/Sub messages are delivered via HTTP POST, but the traceparent lives in message.attributes, not HTTP headers. TracingInterceptor detects this and overrides the tracing context from the message attributes.' },
+          { type: 'insight', icon: '📡', title: 'AsyncLocalStorage for zero-overhead propagation', body: 'TracingService wraps Node.js AsyncLocalStorage. Once runWithTracingInformation() sets the context, any code in the same async chain (guards, interceptors, service clients, Pub/Sub handlers) can call getCorrelationId() and getTraceparent() without any parameter threading. This is how correlation IDs flow from the HTTP handler all the way into outgoing service client requests.' },
+        ],
+        files: [{ filename: 'tracing.middleware.ts + interceptor', lang: 'typescript', code: D.tracing }],
+      },
+      {
+        title: 'Token-Based Rate Limiting',
+        callouts: [
+          { type: 'critical', icon: '🔴', title: 'IP-based rate limiting fails at enterprise scale', body: 'When 500 employees at a company share a corporate NAT, they all appear as one IP. IP-based limiting would block the entire company after 10 requests/second. Token-based limiting gives each API key its own bucket — the API key is the unit of rate limiting, not the network location.' },
+          { type: 'pattern', icon: '🔑', title: 'SHA-256 hash of token as bucket key', body: 'The rate limiter stores buckets in Redis keyed by a hash of the API token. SHA-256(token) is deterministic, fixed-length, and does not store the raw token in Redis (where it would be a security exposure). If the token is compromised, rotating it immediately changes the bucket key, invalidating the old rate limit history.' },
+        ],
+        files: [{ filename: 'tokenRateLimiter.guard.ts', lang: 'typescript', code: D.rateLimiting }],
       },
     ],
   },
